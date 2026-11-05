@@ -11,7 +11,7 @@ from calbi.ai.verifier import Verdict, Verifier
 from calbi.core.engine import set_delegate_handler
 from calbi.core.policy import ApprovalRequest, Autonomy
 from calbi.core.schema import Playbook
-from calbi.core.state import RunState, RunStatus
+from calbi.core.state import RunState, RunStatus, StepStatus
 
 if TYPE_CHECKING:
     from calbi.core.engine import Calbi
@@ -52,11 +52,22 @@ async def delegate_loop(
     replanner = Replanner(planner=planner)
 
     # 1. UNDERSTAND / PLAN / VALIDATE
+    memory_hints: list[str] = []
+    memory_templates: list[Playbook] = []
+    if engine.memory is not None:
+        similar_records = engine.memory.find_similar(task)
+        memory_templates = [rec.playbook for rec in similar_records]
+        for tool_spec in engine.registry.list():
+            for lim in engine.memory.tool_limitations(tool_spec.name):
+                memory_hints.append(f"Tool '{tool_spec.name}' limitation/failure: {lim}")
+
     plan_result = await planner.plan(
         task=task,
         inputs=inputs,
         constraints=constraints,
         expected_output=expected_output,
+        hints=memory_hints,
+        templates=memory_templates,
     )
     current_playbook = plan_result.playbook
     report.plans.append(current_playbook)
@@ -138,6 +149,17 @@ async def delegate_loop(
         last_run = run_state
 
         if run_state.status != RunStatus.SUCCEEDED:
+            if engine.memory is not None:
+                step_tools = {s.id: s.tool for s in current_playbook.steps}
+                for s_id, s_state in run_state.steps.items():
+                    if s_state.status == StepStatus.FAILED:
+                        engine.memory.record_failure(
+                            task=task,
+                            playbook_name=current_playbook.name,
+                            step_id=s_id,
+                            tool=step_tools.get(s_id),
+                            error=s_state.error or "Execution failed",
+                        )
             if replan_count < engine.policy.max_replans:
                 replan_count += 1
                 report.replans = replan_count
@@ -166,6 +188,8 @@ async def delegate_loop(
             run=run_state,
         )
         if verdict.passed:
+            if engine.memory is not None:
+                engine.memory.save_run(task, current_playbook, run_state, verdict)
             report.duration_s = time.time() - start_time
             report.events = list(engine.events.history)
             return DelegationResult(

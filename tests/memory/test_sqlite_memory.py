@@ -77,3 +77,53 @@ def test_sqlite_memory_auto_promotion_with_n_runs() -> None:
     assert len(similar) == 1
     assert similar[0].status == "validated"
     assert similar[0].run_count == 3
+
+
+def test_sqlite_memory_schema_version_exists() -> None:
+    mem = SQLiteMemory(":memory:")
+    cur = mem.conn.cursor()
+    cur.execute("SELECT version FROM schema_version")
+    rows = cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == 1
+
+
+async def test_sqlite_memory_integration_with_engine_and_planner() -> None:
+    import json
+
+    from calbi import Autonomy, Calbi
+    from calbi.testing.fake_llm import FakeLLM
+
+    mem = SQLiteMemory(":memory:")
+    mem.record_failure(
+        task="Extract PDF",
+        playbook_name="pdf_pb",
+        step_id="s1",
+        tool="pdf.extract",
+        error="Encrypted PDFs are unsupported",
+    )
+
+    llm = FakeLLM(
+        responses=[
+            json.dumps(
+                {
+                    "name": "pdf_plan",
+                    "steps": [{"id": "s1", "tool": "pdf.extract", "inputs": {}}],
+                }
+            ),
+            json.dumps({"passed": True, "reasons": ["ok"], "confidence": 1.0}),
+        ]
+    )
+
+    engine = Calbi(llm=llm, autonomy=Autonomy.AUTONOMOUS, memory=mem)
+
+    @engine.tool(name="pdf.extract")
+    def extract() -> dict[str, str]:
+        return {"text": "hello"}
+
+    res = await engine.adelegate(task="Extract PDF content")
+    assert res.status == "succeeded"
+
+    # Verify tool limitation from memory was injected into the planner system prompt
+    system_prompt = llm.calls[0].messages[0].content
+    assert "Encrypted PDFs are unsupported" in system_prompt

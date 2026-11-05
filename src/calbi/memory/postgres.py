@@ -9,8 +9,12 @@ from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
-import psycopg
-from psycopg import sql
+try:
+    import psycopg
+    from psycopg import sql
+except ImportError:  # pragma: no cover
+    psycopg = None  # type: ignore[assignment]
+    sql = None  # type: ignore[assignment]
 
 from calbi.ai.adapters.openai_compat import ConfigError
 from calbi.ai.verifier import Verdict
@@ -59,8 +63,13 @@ class PostgresMemory:
         self.schema = schema
         self.pool_size = pool_size
 
-    def _get_connection(self) -> psycopg.Connection[Any]:
+    def _get_connection(self) -> Any:
         """Establish connection with retries to handle Neon serverless cold starts."""
+        if psycopg is None:
+            raise ConfigError(
+                "psycopg is required for PostgresMemory. "
+                "Install with: pip install 'calbi[postgres]'"
+            )
         assert self.dsn is not None
         attempts = 0
         max_attempts = 3

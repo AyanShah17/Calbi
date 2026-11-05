@@ -54,6 +54,7 @@ class Planner:
         constraints: Sequence[str] = (),
         expected_output: str | None = None,
         hints: Sequence[str] = (),
+        templates: Sequence[Playbook] = (),
     ) -> PlanResult:
         """Plan and generate a validated playbook for the given task and capabilities."""
         inputs = dict(inputs or {})
@@ -70,7 +71,15 @@ class Planner:
                 truncated_inputs[k] = v
 
         tools_manifest = json.dumps(self.registry.describe(), indent=2)
-        hints_text = "\n".join(f"- {h}" for h in hints) if hints else "None provided."
+        combined_hints = list(hints)
+        for tmpl in templates:
+            combined_hints.append(
+                f"Validated Playbook Template '{tmpl.name}': "
+                f"{json.dumps(tmpl.model_dump(mode='json'))}"
+            )
+        hints_text = (
+            "\n".join(f"- {h}" for h in combined_hints) if combined_hints else "None provided."
+        )
 
         system_msg = PLANNER_SYSTEM_PROMPT.format(
             tools_manifest=tools_manifest,

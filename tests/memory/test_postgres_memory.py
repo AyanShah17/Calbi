@@ -23,6 +23,29 @@ def test_postgres_dsn_validation() -> None:
         validate_dsn(remote_no_ssl)
 
 
+def test_postgres_cold_start_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from calbi.memory import postgres
+
+    calls = 0
+
+    def fake_connect(dsn: str, autocommit: bool = True) -> object:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RuntimeError("Neon cold start timeout")
+        return {"connected": True, "dsn": dsn}
+
+    monkeypatch.setattr(postgres, "psycopg", SimpleNamespace(connect=fake_connect))
+    monkeypatch.setattr(postgres.time, "sleep", lambda _: None)
+
+    mem = PostgresMemory(dsn="postgresql://user:pass@localhost:5432/mydb")
+    conn = mem._get_connection()
+    assert conn == {"connected": True, "dsn": "postgresql://user:pass@localhost:5432/mydb"}
+    assert calls == 3
+
+
 def test_no_fstring_sql_in_postgres_module() -> None:
     import inspect
 

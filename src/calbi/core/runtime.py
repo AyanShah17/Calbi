@@ -83,7 +83,7 @@ class Runtime:
         cancel_event = asyncio.Event()
         self._active_runs[run_id] = cancel_event
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         total_attempts = 0
 
         # 2. Check resume_from for reusable succeeded steps
@@ -309,7 +309,7 @@ class Runtime:
                         break
 
                     # Budget check
-                    if (time.time() - start_time) > self.policy.max_runtime_s:
+                    if (time.perf_counter() - start_time) > self.policy.max_runtime_s:
                         step_state.status = StepStatus.FAILED
                         step_state.error = "Runtime budget exceeded."
                         abort_run = True
@@ -341,7 +341,7 @@ class Runtime:
                         else:
                             coro = asyncio.to_thread(tool_spec.fn, **rendered_step_inputs)
 
-                        now = time.time()
+                        now = time.perf_counter()
                         rem_budget = self.policy.max_runtime_s - (now - start_time)
                         if rem_budget <= 0:
                             step_state.status = StepStatus.FAILED
@@ -380,8 +380,11 @@ class Runtime:
                         break
 
                     except TimeoutError:
-                        now = time.time()
-                        if (now - start_time) >= self.policy.max_runtime_s:
+                        now = time.perf_counter()
+                        if (
+                            step.timeout_s is None
+                            or (now - start_time) >= self.policy.max_runtime_s
+                        ):
                             err_msg = "Runtime budget exceeded."
                             abort_run = True
                         else:
@@ -477,14 +480,21 @@ class Runtime:
         self._active_runs.pop(run_id, None)
 
         # 3. Determine final RunState
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.perf_counter() - start_time
+        budget_errors = [
+            s.error
+            for s in steps_state.values()
+            if s.error in ("Runtime budget exceeded.", "Total attempt budget exceeded.")
+        ]
         if cancel_event.is_set():
             run_state.status = RunStatus.CANCELLED
             run_state.error = "Run was cancelled."
-        elif elapsed_time > self.policy.max_runtime_s:
+        elif budget_errors or elapsed_time > self.policy.max_runtime_s:
             run_state.status = RunStatus.FAILED
             run_state.error = (
-                f"Runtime budget exceeded: {elapsed_time:.3f}s > {self.policy.max_runtime_s}s."
+                budget_errors[0]
+                if budget_errors
+                else f"Runtime budget exceeded: {elapsed_time:.3f}s > {self.policy.max_runtime_s}s."
             )
         elif abort_run or any(s.status == StepStatus.FAILED for s in steps_state.values()):
             failed_steps = [s.id for s in steps_state.values() if s.status == StepStatus.FAILED]
@@ -535,7 +545,7 @@ class Runtime:
                     "status": run_state.status.value,
                     "error": run_state.error,
                     "replan_requested": replan_requested,
-                    "duration_s": time.time() - start_time,
+                    "duration_s": time.perf_counter() - start_time,
                     "total_attempts": total_attempts,
                 },
             )

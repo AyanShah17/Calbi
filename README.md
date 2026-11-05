@@ -5,7 +5,7 @@ Calbi is a Python library that lets an AI agent take a task, work out how to do 
 > **The AI proposes. The runtime disposes.**
 > The model only ever produces *data* (a structured playbook). The runtime validates that data and is the only thing that executes anything, and only through tools the host application has registered.
 
-Status: **pre-alpha, planning stage.** See [PLAN.md](PLAN.md) for the build plan. Agents implementing the work should start there.
+Status: **v0.1.0 (initial implementation complete).** See [PLAN.md](PLAN.md) for the build plan and architecture details.
 
 ---
 

@@ -371,12 +371,12 @@ Each WP lists: Owns · Depends on · Tasks · Acceptance tests (must exist and p
 
 ## 7. V0.1 definition of done
 
-- [ ] `pip install calbi` gives the deterministic engine with no AI dependency
-- [ ] The README developer-experience snippet works offline with FakeLLM
-- [ ] Dataset e2e scenario passes including replan and resume
-- [ ] Safety suite passes
-- [ ] Autonomy levels 0–3 behave per the table
-- [ ] Docs and examples present, CI green
+- [x] `pip install calbi` gives the deterministic engine with no AI dependency
+- [x] The README developer-experience snippet works offline with FakeLLM
+- [x] Dataset e2e scenario passes including replan and resume
+- [x] Safety suite passes
+- [x] Autonomy levels 0–3 behave per the table
+- [x] Docs and examples present, CI green
 
 ## 8. Later (V0.2+)
 
