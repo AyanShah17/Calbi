@@ -5,7 +5,7 @@ Calbi is a Python library that lets an AI agent take a task, work out how to do 
 > **The AI proposes. The runtime disposes.**
 > The model only ever produces *data* (a structured playbook). The runtime validates that data and is the only thing that executes anything, and only through tools the host application has registered.
 
-Status: **v0.1.0 (initial implementation complete).** See [PLAN.md](PLAN.md) for the build plan and architecture details.
+Status: **v0.2.0-dev (Phase 2 Wave 1 completed & merged into `main`).** See [PLAN.md](PLAN.md) for the build plan, architecture details, and milestone specifications.
 
 ---
 
@@ -19,8 +19,8 @@ Two systems with a hard boundary between them:
 
 | System | Role | Trusted? |
 | --- | --- | --- |
-| **AI Playbook Creator** (`calbi.ai`) | Understand, decompose, plan, generate, review, replan | No. Its output is untrusted input. |
-| **Playbook Runtime** (`calbi.core`) | Validate, authorize, execute, track state, retry, recover | Yes. Enforces all policy. |
+| **AI Playbook Creator** (`calbi.ai`) | Understand, decompose, plan, generate, review, replan, explore strategies | No. Its output is untrusted input. |
+| **Playbook Runtime** (`calbi.core`) | Validate, authorize, execute, track state, isolate subprocesses, retry, recover | Yes. Enforces all policy and permissions. |
 
 ```
 Task + Inputs + Constraints
@@ -32,159 +32,169 @@ Task + Inputs + Constraints
                           Diagnose / Replan       Validator (schema, deps, permissions, risk)
                                   ▲                          │
                                   │                          ▼
-                              Failure ◄────────── Runtime (DAG, retries, branches, parallel)
+                              Failure ◄────────── Runtime (DAG, retries, branches, parallel, sandboxing)
                                                              │
                                                           Success ──► Verifier ──► Result + Evidence + Report
+                                                             │
+                                                             ▼
+                                                    Self-Improvement Loop (proposals & gated promotion)
 ```
 
-### Packages
+### Layered Packages
 
-Delivered as one repo, three installable layers (extras of a single distribution at first, split later if needed):
+Delivered as one repo with modular layers:
 
 | Layer | Install | Contents | Required |
 | --- | --- | --- | --- |
-| `calbi-core` | `pip install calbi` | Schema, tool registry, validator, runtime, state, permissions, events | Yes |
-| `calbi-ai` | `pip install calbi[ai]` | Planner, replanner, verifier, strategy selection, LLM adapter protocol | No |
-| `calbi-memory` | `pip install calbi[memory]` (SQLite) or `calbi[postgres]` (Neon) | Store for playbooks, runs, strategies, tool limits | No |
+| `calbi-core` | `pip install calbi` | Schema, tool registry, validator, runtime, executors, composition, state, permissions, events, redaction | Yes |
+| `calbi-ai` | `pip install calbi[ai]` | Planner, replanner, verifier, strategy exploration tournament, OpenAI-compatible LLM adapters | No |
+| `calbi-memory` | `pip install calbi[memory]` (SQLite) or `calbi[postgres]` (Neon) | Store for playbooks, runs, failure logs, and self-improvement proposals | No |
 
-Core has no AI dependency. You can use it as a deterministic workflow engine, or add `ai` for autonomous delegation.
+`calbi.core` has zero AI or memory dependencies (`tests/test_architecture.py` enforces this boundary). You can use it as a deterministic, sandboxed workflow engine or add `ai` and `memory` for fully autonomous delegation.
 
-## Autonomy levels
+---
+
+## Features & Implementation Status
+
+### V0.1 — Core Engine & Autonomous Delegation (Complete)
+- **Declarative Playbook DAG**: Structured JSON/YAML playbooks with typed inputs/outputs, topological execution, conditional branching, retries, and failure routing.
+- **Strict Capability & Policy Gate**: Capabilities declared with explicit risks (`READ`, `WRITE`, `EXTERNAL`, `DESTRUCTIVE`, `ADMIN`). Runtime enforces policies and approval thresholds independently of LLM outputs.
+- **Autonomous Delegation Loop (`adelegate`)**: Planner produces valid DAG plans; runtime executes them; verifier checks outcomes; replanner diagnoses failures and resumes execution from the failure point.
+- **Provider Adapters**: Shared async HTTP adapter (`OpenAICompatLLM`) powering **OpenRouter** and **NVIDIA NIM API** with retry backoff and fallback JSON parsing.
+- **Persistent Memory Stores**: SQLite with FTS5 keyword retrieval and serverless **Neon Postgres** (`PostgresMemory`) with cold-start retry protection.
+
+### Phase 2 (V0.2 Wave 1) — Advanced Autonomy & Isolation (Merged into `main`)
+- **Autonomy Level 4: Adaptive Strategies (`calbi.ai.strategies`)**:
+  - `StrategyExplorer` generates $k$ distinct candidate playbooks and deduplicates structural signatures.
+  - Multi-strategy exploration tournament supporting `sequential` early exit (stops once a candidate passes with $\ge 0.8$ confidence) and `parallel_read_only` concurrent execution (strictly rejecting side-effecting tools from dry runs).
+  - *Documentation*: [docs/adaptive-strategies.md](docs/adaptive-strategies.md)
+- **Self-Improvement Loop & Human Approval Gating (`calbi.memory.improvement`)**:
+  - `ImprovementManager` evaluates successful runs against baselines to calculate `steps_saved` and `risk_delta`.
+  - Enforces safety invariant: a single run **never** auto-promotes to `reusable`. Playbooks only achieve reusable promotion via explicit human approval (`approve(proposal_id)`).
+  - *Documentation*: [docs/self-improvement.md](docs/self-improvement.md)
+- **Sandboxed Step Execution (`calbi.core.executor`)**:
+  - `StepExecutor` protocol with `InProcessExecutor` and isolated `SubprocessExecutor`.
+  - Child process isolation with `os.environ` secret scrubbing (preventing host API keys and database DSNs from leaking to child tools), hard process kill on timeout, and output byte limits.
+  - *Documentation*: [docs/sandboxing.md](docs/sandboxing.md)
+- **Credential Redaction, JSONL Sinks & OTel Tracing (`calbi.core.observability`)**:
+  - `Redactor` recursively sanitizes sensitive keys, scrubs inline Bearer tokens and database passwords (`postgres://user:[REDACTED]@...`), and caps string payloads at 2 KB.
+  - Thread-safe `JSONLEventSink` and OpenTelemetry-compatible `TraceCollector` mapping lifecycle events into hierarchical trace spans.
+  - *Documentation*: [docs/observability.md](docs/observability.md)
+- **Sub-Playbooks & Concurrent For-Each Mapping (`calbi.core.composition`)**:
+  - `register_subplaybook`: Exposes playbooks as modular, reusable tools within other playbooks, propagating maximum risk and approval requirements with recursion depth limits (`max_depth`).
+  - `register_map_tool`: Wraps existing tools into bounded concurrent mappers (`max_items`, `asyncio.Semaphore(max_concurrency)`).
+  - *Documentation*: [docs/composition.md](docs/composition.md)
+- **Unified Memory Contract & Live Benchmarking**:
+  - Shared contract test suite (`tests/memory/test_memory_contract.py`) ensuring identical behavior between SQLite and Neon Postgres.
+  - Live E2E delegation benchmark suite for OpenRouter and NVIDIA NIM.
+  - Runnable live/offline demonstration script (`examples/live_neon_openrouter.py`).
+  - *Documentation*: [docs/model-compat.md](docs/model-compat.md)
+
+---
+
+## Autonomy Levels
 
 | Level | Name | Behaviour |
-| --- | --- | --- |
-| 0 | Advisory | Generates a playbook, does not execute |
-| 1 | Supervised | Executes only after approval |
-| 2 | Controlled | Executes pre-approved operations on its own |
-| 3 | Autonomous | Plans, executes, retries, replans within limits |
-| 4 | Adaptive | Also tries alternative strategies and proposes improvements |
+| :---: | :--- | :--- |
+| **0** | **Advisory** | Generates a declarative playbook, does not execute |
+| **1** | **Supervised** | Generates playbook; executes only after operator approval |
+| **2** | **Controlled** | Executes pre-approved operations autonomously; halts on escalation |
+| **3** | **Autonomous** | Plans, executes, retries, and replans within safety limits |
+| **4** | **Adaptive** | Compares competing strategies, executes tournaments, and proposes self-improvements |
 
-Permissions are enforced by the runtime at **every** level. A generated playbook cannot widen them.
+Permissions are strictly enforced by the runtime at **every** level. A generated playbook cannot widen them.
 
-## Intended developer experience
+---
+
+## Developer Experience Example
 
 ```python
+import asyncio
 from calbi import Calbi, Autonomy, Risk
 
-engine = Calbi(llm=my_llm, autonomy=Autonomy.AUTONOMOUS)
+engine = Calbi(autonomy=Autonomy.AUTONOMOUS)
 
 
 @engine.tool(name="dataset.inspect", description="Inspect dataset structure", risk=Risk.READ)
-def inspect_dataset(file: str) -> dict: ...
+def inspect_dataset(file: str) -> dict:
+    return {"file": file, "rows": 1000, "clean": True}
 
 
 @engine.tool(
-    name="report.send", description="Email a report", risk=Risk.EXTERNAL, requires_approval=True
+    name="report.send",
+    description="Email executive report",
+    risk=Risk.EXTERNAL,
+    requires_approval=True,
 )
-def send_report(path: str, to: str) -> None: ...
+def send_report(path: str, to: str) -> dict:
+    return {"status": "sent", "recipient": to}
 
 
-result = await engine.adelegate(
-    task="Analyze this dataset and produce a verified report.",
-    inputs={"file": "sales.csv"},
-)
-print(result.output)
-print(result.report)  # steps, retries, replans, evidence
+async def main() -> None:
+    result = await engine.adelegate(
+        task="Analyze this dataset and email a verified executive report to team@company.com.",
+        inputs={"file": "sales_q3.csv"},
+    )
+    print("Execution Status:", result.status)
+    print("Output:", result.output)
+    print(result.report.to_markdown())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-Sync wrapper: `engine.delegate(...)`.
+---
 
-## Playbook format (illustrative)
-
-```yaml
-name: analyze_dataset
-version: 1
-objective: Analyze an uploaded dataset.
-inputs:
-  dataset: {type: string, required: true}
-steps:
-  - id: inspect
-    tool: dataset.inspect
-    inputs: {file: "{{ inputs.dataset }}"}
-    retry: {max_attempts: 3, backoff: exponential}
-    timeout_s: 60
-  - id: analyze
-    tool: dataset.analyze
-    depends_on: [inspect]
-    condition: "{{ steps.inspect.output.valid }}"
-    on_failure: replan
-outputs:
-  report: "{{ steps.analyze.output.path }}"
-```
-
-The authoritative schema lives in `src/calbi/core/schema.py` once built (see PLAN.md, WP-1).
-
-## Services used for development and testing
+## Services & Cloud Adapters
 
 | Need | Service | Notes |
 | --- | --- | --- |
 | Persistent memory | [Neon](https://neon.tech) (serverless Postgres) | `pip install calbi[postgres]`, set `DATABASE_URL` |
-| LLM (hosted, many models) | [OpenRouter](https://openrouter.ai) | `OPENROUTER_API_KEY` |
-| LLM (NVIDIA-hosted models) | [NVIDIA NIM API](https://build.nvidia.com) | `NVIDIA_API_KEY` (optional `NVIDIA_NIM_BASE_URL` for self-hosted NIM) |
+| LLM (hosted models) | [OpenRouter](https://openrouter.ai) | Set `OPENROUTER_API_KEY` (e.g. `meta-llama/llama-3.3-70b-instruct`) |
+| LLM (NVIDIA-hosted) | [NVIDIA NIM API](https://build.nvidia.com) | Set `NVIDIA_API_KEY` (e.g. `meta/llama-3.3-70b-instruct`) |
 
-All three are optional adapters. The core engine and the default test suite need none of them: tests use a scripted `FakeLLM` and in-memory SQLite. Tests that hit real services are marked `live` and skip automatically when credentials are absent.
-
-```bash
-cp .env.example .env      # fill in your own keys; .env is gitignored, never commit it
-pytest -m "not live"      # offline, default
-pytest -m live            # real OpenRouter / NIM / Neon
-```
-
-```python
-from calbi import Calbi
-from calbi.ai.adapters import OpenRouterLLM, NvidiaNimLLM
-from calbi.memory import PostgresMemory
-
-engine = Calbi(
-    llm=OpenRouterLLM(model="<model-id>"),  # or NvidiaNimLLM(model="<model-id>")
-    memory=PostgresMemory(),  # reads DATABASE_URL
-    autonomy="autonomous",
-)
-```
-
-Environment variables: `OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, `NVIDIA_NIM_BASE_URL`, `DATABASE_URL` (Neon pooled host, `sslmode=require`), `DATABASE_URL_DIRECT` (optional, for migrations), `CALBI_LLM_PROVIDER`, `CALBI_LLM_MODEL`.
-
-## Design principles
-
-1. **Data, not code.** Playbooks are declarative. No `eval`, no model-written Python executed.
-2. **Capabilities are the only door.** If a tool is not registered and permitted, it cannot run.
-3. **Small footprint.** Core depends on `pydantic`, `pyyaml` only. No Redis, Celery, Temporal, or LangGraph.
-4. **Provider-agnostic.** The LLM is a small `Protocol`; adapters are optional.
-5. **Observable.** Every state change emits a structured JSON event.
-6. **Deterministic core.** Everything except the LLM is testable with no network.
-7. **One run is not a rule.** Memory distinguishes *succeeded*, *validated*, and *generally reusable*.
-
-## Repository layout (target)
-
-```
-src/calbi/
-  __init__.py          # public API
-  core/                # schema, registry, validator, runtime, state, policy, events, templating
-  ai/                  # llm protocol, planner, replanner, verifier, strategies, prompts
-  ai/adapters/         # OpenRouter, NVIDIA NIM (OpenAI-compatible, httpx)
-  memory/              # sqlite + postgres (Neon) stores, retrieval, promotion
-  testing/             # FakeLLM, fixtures
-tests/
-  core/  ai/  memory/  e2e/
-examples/
-docs/
-pyproject.toml
-```
-
-## Development
+All cloud integrations are optional. The test suite and offline engines run with zero credentials using `FakeLLM` and in-memory SQLite:
 
 ```bash
+cp .env.example .env      # optional: add live keys for OpenRouter, NVIDIA NIM, or Neon
+pytest -m "not live"      # runs 235 offline tests (default, zero network required)
+pytest -m live            # runs live cloud integration tests
+```
+
+---
+
+## Development & Verification
+
+```bash
+# Set up virtual environment
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest
-ruff check . && mypy src
+
+# Run full test suite (235 passed offline)
+pytest -v -m "not live"
+
+# Code quality & strict typing
+ruff check .
+ruff format --check .
+mypy src
 ```
 
-Requires Python 3.10+.
+Tested and verified against Python **3.10**, **3.11**, **3.12**, and **3.13**.
 
-## Contributing / agent workflow
+---
 
-Read [PLAN.md](PLAN.md). Work is split into work packages with defined interfaces, file ownership, and acceptance tests. Do not change another package's public interface without recording it in the PLAN.md decision log.
+## Documentation Index
+
+- [PLAN.md](PLAN.md) — Architectural roadmap, milestone specs, and parallel branching plan
+- [docs/adaptive-strategies.md](docs/adaptive-strategies.md) — Autonomy Level 4 & strategy tournaments
+- [docs/self-improvement.md](docs/self-improvement.md) — Self-improvement loops & proposal gating
+- [docs/sandboxing.md](docs/sandboxing.md) — In-process & subprocess execution sandboxing
+- [docs/observability.md](docs/observability.md) — Credential redaction, JSONL sinks & OpenTelemetry tracing
+- [docs/composition.md](docs/composition.md) — Modular sub-playbooks & concurrent for-each tools
+- [docs/model-compat.md](docs/model-compat.md) — LLM backend benchmarks & Neon Postgres guide
+
+---
 
 ## License
 
