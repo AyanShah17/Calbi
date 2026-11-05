@@ -379,7 +379,7 @@ class Runtime:
                         )
                         break
 
-                    except TimeoutError:
+                    except (TimeoutError, asyncio.TimeoutError):  # noqa: UP041 (py3.10 compat)
                         now = time.perf_counter()
                         if (
                             step.timeout_s is None
