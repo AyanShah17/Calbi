@@ -201,10 +201,7 @@ class SubprocessExecutor:
                 f"Tool '{spec.name}' inputs are not JSON-serializable: {exc}"
             ) from exc
 
-        child_env = {
-            k: v for k, v in os.environ.items()
-            if k in self.allowed_env_keys
-        }
+        child_env = {k: v for k, v in os.environ.items() if k in self.allowed_env_keys}
 
         try:
             proc = await asyncio.create_subprocess_exec(

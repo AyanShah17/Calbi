@@ -293,9 +293,7 @@ async def test_subprocess_allows_configured_env_keys() -> None:
     """Verify SubprocessExecutor allows explicitly whitelisted environment keys."""
     os.environ["CUSTOM_ALLOWED_TOKEN"] = "allowed_val_999"
     try:
-        executor = SubprocessExecutor(
-            allowed_env_keys=frozenset({"PATH", "CUSTOM_ALLOWED_TOKEN"})
-        )
+        executor = SubprocessExecutor(allowed_env_keys=frozenset({"PATH", "CUSTOM_ALLOWED_TOKEN"}))
         spec = ToolSpec(
             name="read_custom_env",
             description="read custom env",
@@ -434,9 +432,7 @@ async def test_subprocess_max_output_bytes_exceeded_raises_isolation_error() -> 
 
     with pytest.raises(ExecutionIsolationError) as exc_info:
         await executor.execute(spec, {"size": 2048})
-    assert "exceeded" in str(exc_info.value) or "exited with non-zero code" in str(
-        exc_info.value
-    )
+    assert "exceeded" in str(exc_info.value) or "exited with non-zero code" in str(exc_info.value)
 
 
 @pytest.mark.asyncio

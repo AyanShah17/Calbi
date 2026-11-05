@@ -36,6 +36,7 @@ All executors implement the `@runtime_checkable` `StepExecutor` protocol:
 from typing import Any, Protocol, runtime_checkable
 from calbi.core.registry import ToolSpec
 
+
 @runtime_checkable
 class StepExecutor(Protocol):
     async def execute(
@@ -125,12 +126,14 @@ from calbi.core.registry import ToolSpec
 # Host process holds sensitive credentials
 os.environ["SECRET_KEY"] = "super-secret-token"
 
+
 # Define top-level tool function
 def get_safe_status() -> dict[str, str | None]:
     return {
         "status": "ready",
         "secret": os.environ.get("SECRET_KEY"),  # Returns None in child!
     }
+
 
 executor = SubprocessExecutor(
     allowed_env_keys=frozenset({"PATH"}),
