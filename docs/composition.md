@@ -52,18 +52,18 @@ from calbi.core.schema import InputSpec, Playbook, Step
 
 reg = ToolRegistry()
 
+
 @reg.tool(name="calc_tax")
 def calc_tax(amount: float) -> dict[str, float]:
     return {"tax": amount * 0.15}
+
 
 # 1. Define subplaybook
 sub_pb = Playbook(
     name="tax_service",
     objective="Compute standard tax on order amount",
     inputs={"amount": InputSpec(type="number", description="Order subtotal")},
-    steps=[
-        Step(id="calc", tool="calc_tax", inputs={"amount": "{{ inputs.amount }}"})
-    ],
+    steps=[Step(id="calc", tool="calc_tax", inputs={"amount": "{{ inputs.amount }}"})],
     outputs={"tax_amount": "{{ steps.calc.output.tax }}"},
 )
 
@@ -133,10 +133,12 @@ from calbi.core.registry import ToolRegistry
 
 reg = ToolRegistry()
 
+
 @reg.tool(name="fetch_status")
 async def fetch_status(service_name: str) -> dict[str, str]:
     await asyncio.sleep(0.01)
     return {"service": service_name, "status": "healthy"}
+
 
 # Register mapped tool
 map_spec = register_map_tool(
