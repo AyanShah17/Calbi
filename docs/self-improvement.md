@@ -93,14 +93,15 @@ manager = ImprovementManager(memory=memory)
 # Existing baseline playbook that failed or is slower
 baseline_pb = Playbook(
     name="data_sync_v1",
-    steps=[Step(id="s1", tool="fetch"), Step(id="s2", tool="transform"), Step(id="s3", tool="save")]
+    steps=[
+        Step(id="s1", tool="fetch"),
+        Step(id="s2", tool="transform"),
+        Step(id="s3", tool="save"),
+    ],
 )
 
 # Optimized candidate playbook that succeeded
-candidate_pb = Playbook(
-    name="data_sync_v2",
-    steps=[Step(id="s1", tool="stream_sync")]
-)
+candidate_pb = Playbook(name="data_sync_v2", steps=[Step(id="s1", tool="stream_sync")])
 run = RunState(run_id="run_101", playbook=candidate_pb, status=RunStatus.SUCCEEDED)
 verdict = Verdict(passed=True, confidence=1.0)
 
@@ -115,12 +116,12 @@ proposal = manager.evaluate_improvement(
 
 assert proposal is not None
 print(f"Proposal ID: {proposal.proposal_id}")
-print(f"Steps Saved: {proposal.steps_saved}") # 2
-print(f"Status: {proposal.status.value}")    # pending
+print(f"Steps Saved: {proposal.steps_saved}")  # 2
+print(f"Status: {proposal.status.value}")  # pending
 
 # Operator approves proposal
 record = manager.approve(proposal.proposal_id)
-print(f"Promoted to: {record.status}")       # reusable
+print(f"Promoted to: {record.status}")  # reusable
 
 # Now memory.find_similar() retrieves the approved reusable playbook
 similar = memory.find_similar("sync remote data stream")

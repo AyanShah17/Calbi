@@ -38,9 +38,7 @@ class ImprovementProposal(BaseModel):
     rejection_reason: str | None = None
 
 
-def _compute_playbook_risk(
-    playbook: Playbook, registry: ToolRegistry | None = None
-) -> Risk:
+def _compute_playbook_risk(playbook: Playbook, registry: ToolRegistry | None = None) -> Risk:
     """Determine the maximum risk rank across all steps of a playbook."""
     max_risk = Risk.READ
 
@@ -258,9 +256,7 @@ class ImprovementManager:
         # No improvement or promotion criteria met; single successful run does not auto-promote
         return None
 
-    def list_proposals(
-        self, status: ProposalStatus | None = None
-    ) -> list[ImprovementProposal]:
+    def list_proposals(self, status: ProposalStatus | None = None) -> list[ImprovementProposal]:
         """List proposals, optionally filtered by status."""
         if status is None:
             return list(self._proposals.values())
