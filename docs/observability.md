@@ -42,11 +42,13 @@ Strings longer than `max_string_bytes` (default `2048`) are truncated at byte bo
 from calbi.core.observability import Redactor
 
 redactor = Redactor(max_string_bytes=2048)
-clean_data = redactor.redact({
-    "user": "alice",
-    "API_KEY": "sk-proj-1234567890",
-    "error_log": "Connection failed for postgresql://admin:secret123@db:5432/app",
-})
+clean_data = redactor.redact(
+    {
+        "user": "alice",
+        "API_KEY": "sk-proj-1234567890",
+        "error_log": "Connection failed for postgresql://admin:secret123@db:5432/app",
+    }
+)
 # clean_data["API_KEY"] == "[REDACTED]"
 # clean_data["error_log"] == "Connection failed for postgresql://admin:[REDACTED]@db:5432/app"
 ```
@@ -101,5 +103,7 @@ bus.subscribe(collector)
 
 # Retrieve all recorded spans
 for span in collector.spans:
-    print(f"{span.name} [{span.status}]: parent={span.parent_span_id} duration={span.end_ts - span.start_ts if span.end_ts else 'running'}")
+    print(
+        f"{span.name} [{span.status}]: parent={span.parent_span_id} duration={span.end_ts - span.start_ts if span.end_ts else 'running'}"
+    )
 ```

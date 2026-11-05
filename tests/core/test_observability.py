@@ -63,7 +63,9 @@ def test_redactor_scrubs_inline_bearer_and_dsn() -> None:
     assert "eyJhbGci" not in scrubbed_bearer
 
     # Postgres DSN password scrubbing
-    msg_dsn = "Failed connecting to postgresql://calbi_admin:super_secret_pw@db.internal:5432/calbi_db"
+    msg_dsn = (
+        "Failed connecting to postgresql://calbi_admin:super_secret_pw@db.internal:5432/calbi_db"
+    )
     scrubbed_dsn = redactor.redact(msg_dsn)
     assert (
         scrubbed_dsn
@@ -73,10 +75,7 @@ def test_redactor_scrubs_inline_bearer_and_dsn() -> None:
 
     # Alternative scheme postgres://
     msg_alt_dsn = "postgres://root:very_secret_pwd@127.0.0.1:5432/test"
-    assert (
-        redactor.redact(msg_alt_dsn)
-        == "postgres://root:[REDACTED]@127.0.0.1:5432/test"
-    )
+    assert redactor.redact(msg_alt_dsn) == "postgres://root:[REDACTED]@127.0.0.1:5432/test"
 
 
 def test_redactor_scrubs_api_key_prefixes() -> None:

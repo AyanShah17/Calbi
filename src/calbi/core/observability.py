@@ -19,15 +19,17 @@ class Redactor:
         self,
         *,
         max_string_bytes: int = 2048,
-        sensitive_keys: frozenset[str] | set[str] = frozenset({
-            "api_key",
-            "password",
-            "secret",
-            "token",
-            "authorization",
-            "dsn",
-            "database_url",
-        }),
+        sensitive_keys: frozenset[str] | set[str] = frozenset(
+            {
+                "api_key",
+                "password",
+                "secret",
+                "token",
+                "authorization",
+                "dsn",
+                "database_url",
+            }
+        ),
         extra_patterns: Sequence[re.Pattern[str]] = (),
     ) -> None:
         self.max_string_bytes = max_string_bytes
