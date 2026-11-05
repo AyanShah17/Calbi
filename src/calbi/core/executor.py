@@ -48,7 +48,10 @@ class InProcessExecutor:
             coro = asyncio.to_thread(spec.fn, **inputs)
 
         if timeout_s is not None:
-            result = await asyncio.wait_for(coro, timeout=timeout_s)
+            try:
+                result = await asyncio.wait_for(coro, timeout=timeout_s)
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TimeoutError(f"Tool '{spec.name}' exceeded timeout of {timeout_s}s") from exc
         else:
             result = await coro
 
