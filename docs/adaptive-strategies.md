@@ -158,6 +158,7 @@ from calbi.ai.strategies import StrategyExplorer
 from calbi.core.policy import Autonomy, Policy
 from calbi.core.registry import ToolRegistry
 
+
 async def run_sequential_adaptive(llm: LLM, registry: ToolRegistry) -> None:
     policy = Policy(autonomy=Autonomy.ADAPTIVE)
     explorer = StrategyExplorer(

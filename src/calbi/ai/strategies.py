@@ -466,10 +466,7 @@ class StrategyExplorer:
             )
 
         total_attempts = sum(
-            s.attempts
-            for t in trials
-            if t.run is not None
-            for s in t.run.steps.values()
+            s.attempts for t in trials if t.run is not None for s in t.run.steps.values()
         )
 
         return StrategyExplorationResult(
