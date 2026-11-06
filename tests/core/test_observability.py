@@ -457,3 +457,446 @@ def test_span_record_pydantic_serialization() -> None:
     dumped = span.model_dump()
     assert dumped["status"] == "ok"
     assert dumped["attributes"] == {"key": "val"}
+
+
+def test_redactor_preserves_token_count_metrics() -> None:
+    redactor = Redactor()
+    payload: dict[str, Any] = {
+        "max_tokens": 4096,
+        "tokens_used": 1520,
+        "token_count": 350,
+        "prompt_tokens": 120,
+        "completion_tokens": 230,
+        "total_tokens": 350,
+        "input_tokens": 100,
+        "output_tokens": 250,
+        "tokens": 500,
+        "token_budget": 8000,
+        "cached_tokens": 50,
+        "reasoning_tokens": 64,
+        "prompt_token_count": 120,
+        "candidates_token_count": 230,
+        "total_token_count": 350,
+        "num_tokens": 42,
+        "token_usage": {"prompt": 120, "completion": 230},
+        # Secrets in the same payload MUST still be redacted
+        "api_token": "secret_token_12345",
+        "auth_token": "secret_auth_abc",
+        "access_token": "secret_access_xyz",
+        "session_token": "secret_session_qwe",
+        "github_token": "ghp_1234567890abcdef",
+        "api_key": "sk-1234567890",
+    }
+
+    redacted = redactor.redact(payload)
+    assert isinstance(redacted, dict)
+
+    # All token count/metric keys preserved with original values
+    assert redacted["max_tokens"] == 4096
+    assert redacted["tokens_used"] == 1520
+    assert redacted["token_count"] == 350
+    assert redacted["prompt_tokens"] == 120
+    assert redacted["completion_tokens"] == 230
+    assert redacted["total_tokens"] == 350
+    assert redacted["input_tokens"] == 100
+    assert redacted["output_tokens"] == 250
+    assert redacted["tokens"] == 500
+    assert redacted["token_budget"] == 8000
+    assert redacted["cached_tokens"] == 50
+    assert redacted["reasoning_tokens"] == 64
+    assert redacted["prompt_token_count"] == 120
+    assert redacted["candidates_token_count"] == 230
+    assert redacted["total_token_count"] == 350
+    assert redacted["num_tokens"] == 42
+    assert redacted["token_usage"] == {"prompt": 120, "completion": 230}
+
+    # All secret tokens strictly redacted
+    assert redacted["api_token"] == "[REDACTED]"
+    assert redacted["auth_token"] == "[REDACTED]"
+    assert redacted["access_token"] == "[REDACTED]"
+    assert redacted["session_token"] == "[REDACTED]"
+    assert redacted["github_token"] == "[REDACTED]"
+    assert redacted["api_key"] == "[REDACTED]"
+
+
+def test_redactor_handles_camel_kebab_case_token_metrics() -> None:
+    redactor = Redactor()
+    payload = {
+        "maxTokens": 2048,
+        "max-tokens": 2048,
+        "MAX_TOKENS": 2048,
+        "tokensUsed": 100,
+        "tokens-used": 100,
+        "tokenCount": 50,
+        "token-count": 50,
+        "promptTokens": 30,
+        "prompt-tokens": 30,
+        "completionTokens": 70,
+        "completion-tokens": 70,
+        "totalTokens": 100,
+        "total-tokens": 100,
+        # Camel/kebab secret tokens MUST still be redacted
+        "apiToken": "secret_api",
+        "api-token": "secret_api",
+        "authToken": "secret_auth",
+        "auth-token": "secret_auth",
+        "accessToken": "secret_access",
+        "access-token": "secret_access",
+        "sessionToken": "secret_session",
+        "session-token": "secret_session",
+        "githubToken": "secret_github",
+        "github-token": "secret_github",
+    }
+
+    redacted = redactor.redact(payload)
+    assert isinstance(redacted, dict)
+
+    # Metrics preserved
+    assert redacted["maxTokens"] == 2048
+    assert redacted["max-tokens"] == 2048
+    assert redacted["MAX_TOKENS"] == 2048
+    assert redacted["tokensUsed"] == 100
+    assert redacted["tokens-used"] == 100
+    assert redacted["tokenCount"] == 50
+    assert redacted["token-count"] == 50
+    assert redacted["promptTokens"] == 30
+    assert redacted["prompt-tokens"] == 30
+    assert redacted["completionTokens"] == 70
+    assert redacted["completion-tokens"] == 70
+    assert redacted["totalTokens"] == 100
+    assert redacted["total-tokens"] == 100
+
+    # Secret tokens redacted
+    assert redacted["apiToken"] == "[REDACTED]"
+    assert redacted["api-token"] == "[REDACTED]"
+    assert redacted["authToken"] == "[REDACTED]"
+    assert redacted["auth-token"] == "[REDACTED]"
+    assert redacted["accessToken"] == "[REDACTED]"
+    assert redacted["access-token"] == "[REDACTED]"
+    assert redacted["sessionToken"] == "[REDACTED]"
+    assert redacted["session-token"] == "[REDACTED]"
+    assert redacted["githubToken"] == "[REDACTED]"
+    assert redacted["github-token"] == "[REDACTED]"
+
+
+def test_redactor_strictly_redacts_plural_secret_tokens() -> None:
+    redactor = Redactor()
+    payload = {
+        "api_tokens": ["secret1", "secret2"],
+        "auth_tokens": ["token_a", "token_b"],
+        "token": "raw_secret_value",
+    }
+
+    redacted = redactor.redact(payload)
+    assert isinstance(redacted, dict)
+    assert redacted["api_tokens"] == "[REDACTED]"
+    assert redacted["auth_tokens"] == "[REDACTED]"
+    assert redacted["token"] == "[REDACTED]"
+
+
+def test_redactor_avoids_false_positive_substring_redaction() -> None:
+    redactor = Redactor()
+    payload = {
+        "tokenization": "bpe",
+        "tokenizer_name": "cl100k_base",
+        "stakeholder": "admin_team",
+        "monkey_patch": True,
+    }
+
+    redacted = redactor.redact(payload)
+    assert isinstance(redacted, dict)
+    assert redacted["tokenization"] == "bpe"
+    assert redacted["tokenizer_name"] == "cl100k_base"
+    assert redacted["stakeholder"] == "admin_team"
+    assert redacted["monkey_patch"] is True
+
+
+def test_redactor_custom_allowed_and_sensitive_keys() -> None:
+    redactor = Redactor(
+        sensitive_keys={"custom_pin", "api_key"},
+        allowed_keys={"pin_count", "max_tokens"},
+    )
+    payload = {
+        "custom_pin": "1234",
+        "pin_count": 4,
+        "max_tokens": 1000,
+        "api_key": "sk-test",
+    }
+    redacted = redactor.redact(payload)
+    assert isinstance(redacted, dict)
+    assert redacted["custom_pin"] == "[REDACTED]"
+    assert redacted["pin_count"] == 4
+    assert redacted["max_tokens"] == 1000
+    assert redacted["api_key"] == "[REDACTED]"
+
+
+def test_trace_collector_retry_aware_step_retrying() -> None:
+    collector = TraceCollector()
+    bus = EventBus()
+    bus.subscribe(collector)
+
+    t0 = datetime(2026, 11, 6, 10, 0, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 11, 6, 10, 0, 1, tzinfo=timezone.utc)
+    t2 = datetime(2026, 11, 6, 10, 0, 2, tzinfo=timezone.utc)
+    t3 = datetime(2026, 11, 6, 10, 0, 3, tzinfo=timezone.utc)
+    t4 = datetime(2026, 11, 6, 10, 0, 4, tzinfo=timezone.utc)
+    t5 = datetime(2026, 11, 6, 10, 0, 5, tzinfo=timezone.utc)
+
+    # 1. run.started
+    bus.emit(
+        Event(
+            ts=t0,
+            run_id="run_retry_1",
+            type="run.started",
+            data={"playbook": "flaky_pipeline"},
+        )
+    )
+
+    # 2. step.started attempt 1
+    bus.emit(
+        Event(
+            ts=t1,
+            run_id="run_retry_1",
+            type="step.started",
+            step_id="fetch_data",
+            data={"attempt": 1, "url": "https://api.upstream.com"},
+        )
+    )
+
+    # 3. step.retrying attempt 1 fails
+    bus.emit(
+        Event(
+            ts=t2,
+            run_id="run_retry_1",
+            type="step.retrying",
+            step_id="fetch_data",
+            data={
+                "attempt": 1,
+                "error": "Connection reset by peer with postgresql://u:p@db/d",
+                "delay_s": 1.0,
+            },
+        )
+    )
+
+    # 4. step.started attempt 2
+    bus.emit(
+        Event(
+            ts=t3,
+            run_id="run_retry_1",
+            type="step.started",
+            step_id="fetch_data",
+            data={"attempt": 2, "url": "https://api.upstream.com"},
+        )
+    )
+
+    # 5. step.completed attempt 2 succeeds
+    bus.emit(
+        Event(
+            ts=t4,
+            run_id="run_retry_1",
+            type="step.completed",
+            step_id="fetch_data",
+            data={"output": {"status": "success", "total_tokens": 120}},
+        )
+    )
+
+    # 6. run.completed
+    bus.emit(
+        Event(
+            ts=t5,
+            run_id="run_retry_1",
+            type="run.completed",
+            data={"status": "succeeded"},
+        )
+    )
+
+    spans = collector.spans
+    # 1 root span + 2 step attempt spans = 3 spans total
+    assert len(spans) == 3
+
+    root_span = next(s for s in spans if s.name == "run:flaky_pipeline")
+    step_spans = collector.get_step_spans("run_retry_1", "fetch_data")
+    assert len(step_spans) == 2
+
+    span_attempt_1 = step_spans[0]
+    span_attempt_2 = step_spans[1]
+
+    # Attempt 1 span assertions: distinctly tracked, closed on retry, status error
+    assert span_attempt_1.span_id == "span_retry_1_fetch_data_1" or "1" in span_attempt_1.span_id
+    assert span_attempt_1.status == "error"
+    assert span_attempt_1.start_ts == t1
+    assert span_attempt_1.end_ts == t2
+    assert span_attempt_1.parent_span_id == root_span.span_id
+    assert "postgresql://u:[REDACTED]@db/d" in span_attempt_1.attributes["error"]
+
+    # Attempt 2 span assertions: distinctly tracked, closed on completion, status ok
+    assert span_attempt_2.span_id == "span_retry_1_fetch_data_2" or "2" in span_attempt_2.span_id
+    assert span_attempt_2.status == "ok"
+    assert span_attempt_2.start_ts == t3
+    assert span_attempt_2.end_ts == t4
+    assert span_attempt_2.parent_span_id == root_span.span_id
+    assert span_attempt_2.attributes["output"]["total_tokens"] == 120
+
+    # Root span
+    assert root_span.status == "ok"
+    assert root_span.start_ts == t0
+    assert root_span.end_ts == t5
+
+
+def test_trace_collector_multiple_retries_and_terminal_failure() -> None:
+    collector = TraceCollector()
+    t0 = datetime(2026, 11, 6, 11, 0, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 11, 6, 11, 0, 1, tzinfo=timezone.utc)
+    t2 = datetime(2026, 11, 6, 11, 0, 2, tzinfo=timezone.utc)
+    t3 = datetime(2026, 11, 6, 11, 0, 3, tzinfo=timezone.utc)
+    t4 = datetime(2026, 11, 6, 11, 0, 4, tzinfo=timezone.utc)
+    t5 = datetime(2026, 11, 6, 11, 0, 5, tzinfo=timezone.utc)
+    t6 = datetime(2026, 11, 6, 11, 0, 6, tzinfo=timezone.utc)
+    t7 = datetime(2026, 11, 6, 11, 0, 7, tzinfo=timezone.utc)
+
+    # run.started
+    collector(
+        Event(ts=t0, run_id="run_fail_retries", type="run.started", data={"playbook": "crash_job"})
+    )
+
+    # Attempt 1: started -> retrying
+    collector(
+        Event(
+            ts=t1,
+            run_id="run_fail_retries",
+            type="step.started",
+            step_id="network_call",
+            data={"attempt": 1},
+        )
+    )
+    collector(
+        Event(
+            ts=t2,
+            run_id="run_fail_retries",
+            type="step.retrying",
+            step_id="network_call",
+            data={"attempt": 1, "error": "timeout 1"},
+        )
+    )
+
+    # Attempt 2: started -> retrying
+    collector(
+        Event(
+            ts=t3,
+            run_id="run_fail_retries",
+            type="step.started",
+            step_id="network_call",
+            data={"attempt": 2},
+        )
+    )
+    collector(
+        Event(
+            ts=t4,
+            run_id="run_fail_retries",
+            type="step.retrying",
+            step_id="network_call",
+            data={"attempt": 2, "error": "timeout 2"},
+        )
+    )
+
+    # Attempt 3: started -> failed
+    collector(
+        Event(
+            ts=t5,
+            run_id="run_fail_retries",
+            type="step.started",
+            step_id="network_call",
+            data={"attempt": 3},
+        )
+    )
+    collector(
+        Event(
+            ts=t6,
+            run_id="run_fail_retries",
+            type="step.failed",
+            step_id="network_call",
+            data={"attempts": 3, "error": "exhausted"},
+        )
+    )
+
+    # run.failed
+    collector(Event(ts=t7, run_id="run_fail_retries", type="run.failed", data={"status": "failed"}))
+
+    spans = collector.get_spans("run_fail_retries")
+    assert len(spans) == 4  # 1 root + 3 attempts
+
+    step_spans = collector.get_step_spans("run_fail_retries", "network_call")
+    assert len(step_spans) == 3
+
+    # All 3 attempts recorded with status="error" and accurate durations
+    assert step_spans[0].status == "error"
+    assert step_spans[0].start_ts == t1
+    assert step_spans[0].end_ts == t2
+    assert step_spans[0].attributes["error"] == "timeout 1"
+
+    assert step_spans[1].status == "error"
+    assert step_spans[1].start_ts == t3
+    assert step_spans[1].end_ts == t4
+    assert step_spans[1].attributes["error"] == "timeout 2"
+
+    assert step_spans[2].status == "error"
+    assert step_spans[2].start_ts == t5
+    assert step_spans[2].end_ts == t6
+    assert step_spans[2].attributes["error"] == "exhausted"
+
+
+def test_trace_collector_supersedes_in_progress_attempt() -> None:
+    collector = TraceCollector()
+    t0 = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 11, 6, 12, 0, 1, tzinfo=timezone.utc)
+    t2 = datetime(2026, 11, 6, 12, 0, 2, tzinfo=timezone.utc)
+    t3 = datetime(2026, 11, 6, 12, 0, 3, tzinfo=timezone.utc)
+
+    collector(Event(ts=t0, run_id="run_sup", type="run.started", data={"playbook": "sup_pb"}))
+
+    # Attempt 1 starts but never gets step.retrying before Attempt 2 starts
+    collector(
+        Event(ts=t1, run_id="run_sup", type="step.started", step_id="work", data={"attempt": 1})
+    )
+    # Attempt 2 starts: should close attempt 1
+    collector(
+        Event(ts=t2, run_id="run_sup", type="step.started", step_id="work", data={"attempt": 2})
+    )
+    # Attempt 2 completes
+    collector(
+        Event(ts=t3, run_id="run_sup", type="step.completed", step_id="work", data={"done": True})
+    )
+
+    step_spans = collector.get_step_spans("run_sup", "work")
+    assert len(step_spans) == 2
+
+    assert step_spans[0].status == "error"
+    assert step_spans[0].end_ts == t2
+    assert step_spans[0].attributes.get("superseded_by_retry") is True
+
+    assert step_spans[1].status == "ok"
+    assert step_spans[1].end_ts == t3
+
+
+def test_trace_collector_compound_keys_and_clear() -> None:
+    collector = TraceCollector()
+    t = datetime.now(timezone.utc)
+
+    collector(Event(ts=t, run_id="run_ck", type="run.started", data={"playbook": "p"}))
+    collector(Event(ts=t, run_id="run_ck", type="step.started", step_id="s1", data={"attempt": 1}))
+    collector(Event(ts=t, run_id="run_ck", type="step.retrying", step_id="s1", data={"attempt": 1}))
+    collector(Event(ts=t, run_id="run_ck", type="step.started", step_id="s1", data={"attempt": 2}))
+    collector(
+        Event(ts=t, run_id="run_ck", type="step.completed", step_id="s1", data={"attempt": 2})
+    )
+
+    # Verify compound keys
+    assert ("run_ck", "s1", 1) in collector._step_spans
+    assert ("run_ck", "s1", 2) in collector._step_spans
+    assert collector._step_spans[("run_ck", "s1", 1)] != collector._step_spans[("run_ck", "s1", 2)]
+
+    collector.clear()
+    assert len(collector.spans) == 0
+    assert len(collector._step_spans) == 0
+    assert len(collector._latest_step_spans) == 0
+    assert len(collector._latest_step_attempts) == 0
