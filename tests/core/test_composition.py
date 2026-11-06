@@ -13,8 +13,9 @@ from calbi.core.composition import (
     register_map_tool,
     register_subplaybook,
 )
-from calbi.core.policy import Policy
-from calbi.core.registry import DuplicateToolError, ToolRegistry, UnknownToolError
+from calbi.core.executor import InProcessExecutor, StepExecutor
+from calbi.core.policy import ApprovalRequest, Autonomy, Policy
+from calbi.core.registry import DuplicateToolError, ToolRegistry, ToolSpec, UnknownToolError
 from calbi.core.runtime import Runtime
 from calbi.core.schema import CalbiError, InputSpec, Playbook, Risk, Step
 from calbi.core.state import RunStatus, StepStatus
@@ -156,14 +157,18 @@ async def test_subplaybook_max_depth_recursion_guard() -> None:
     """Recursive subplaybook calling itself exceeds max_depth and raises SubPlaybookError."""
     reg = ToolRegistry()
 
-    # Step invokes self-referential subplaybook tool
+    @reg.tool(name="recurse_step")
+    async def recurse_step(count: int) -> dict[str, Any]:
+        res = await reg.get("recursive_tool").fn(count=count + 1)
+        return dict(res) if isinstance(res, dict) else {"count": count}
+
     recursive_pb = Playbook(
         name="recursive_pb",
         inputs={"count": InputSpec(type="integer")},
         steps=[
             Step(
                 id="rec",
-                tool="recursive_tool",
+                tool="recurse_step",
                 inputs={"count": "{{ inputs.count }}"},
             )
         ],
@@ -189,21 +194,20 @@ async def test_subplaybook_mutual_recursion_guard() -> None:
     """Mutual recursion between two subplaybooks exceeds max_depth and raises SubPlaybookError."""
     reg = ToolRegistry()
 
-    # Playbook A calls subplaybook B; Playbook B calls subplaybook A
+    # Tool B invokes tool_a, and Playbook A calls tool_b
+    @reg.tool(name="tool_b")
+    async def tool_b() -> dict[str, Any]:
+        res = await reg.get("tool_a").fn()
+        return dict(res) if isinstance(res, dict) else {}
+
     pb_a = Playbook(
         name="pb_a",
         steps=[Step(id="call_b", tool="tool_b")],
         outputs={"res": "{{ steps.call_b.output.res }}"},
     )
-    pb_b = Playbook(
-        name="pb_b",
-        steps=[Step(id="call_a", tool="tool_a")],
-        outputs={"res": "{{ steps.call_a.output.res }}"},
-    )
 
     rt = Runtime(reg, Policy())
     register_subplaybook(reg, pb_a, rt, name="tool_a", max_depth=3)
-    register_subplaybook(reg, pb_b, rt, name="tool_b", max_depth=3)
 
     assert _CALL_DEPTH.get() == 0
 
@@ -298,6 +302,55 @@ def test_subplaybook_schema_derivation() -> None:
     assert spec.output_schema["type"] == "object"
     assert "out1" in spec.output_schema["properties"]
     assert "out2" in spec.output_schema["properties"]
+
+
+def test_subplaybook_fails_closed_on_unknown_tool() -> None:
+    """Registering a subplaybook with an unknown tool fails closed with SubPlaybookError."""
+    reg = ToolRegistry()
+    pb = Playbook(
+        name="unknown_tool_pb",
+        steps=[Step(id="s1", tool="non_existent_tool")],
+    )
+    rt = Runtime(reg, Policy())
+    with pytest.raises(SubPlaybookError) as exc_info:
+        register_subplaybook(reg, pb, rt)
+    assert "references unknown tool 'non_existent_tool'" in str(exc_info.value)
+
+
+def test_subplaybook_fails_closed_on_unregistered_self_reference() -> None:
+    """Registering a self-referential subplaybook where tool is not yet registered
+    raises SubPlaybookError.
+    """
+    reg = ToolRegistry()
+    pb = Playbook(
+        name="self_ref_pb",
+        steps=[Step(id="s1", tool="self_ref_pb")],
+    )
+    rt = Runtime(reg, Policy())
+    with pytest.raises(SubPlaybookError) as exc_info:
+        register_subplaybook(reg, pb, rt)
+    assert "references unknown tool 'self_ref_pb'" in str(exc_info.value)
+
+
+def test_subplaybook_fails_closed_prevents_risk_laundering() -> None:
+    """A subplaybook cannot conceal an unknown destructive step behind a registered read step."""
+    reg = ToolRegistry()
+
+    @reg.tool(name="benign_read", risk=Risk.READ)
+    def benign_read() -> str:
+        return "safe"
+
+    pb = Playbook(
+        name="laundering_attempt_pb",
+        steps=[
+            Step(id="s1", tool="benign_read"),
+            Step(id="s2", tool="unregistered_destructive_tool"),
+        ],
+    )
+    rt = Runtime(reg, Policy())
+    with pytest.raises(SubPlaybookError) as exc_info:
+        register_subplaybook(reg, pb, rt)
+    assert "references unknown tool 'unregistered_destructive_tool'" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
@@ -510,3 +563,173 @@ async def test_map_tool_validation_errors() -> None:
     # Empty list is supported
     empty_res = await map_spec.fn(items=[])
     assert empty_res == {"results": [], "count": 0}
+
+
+class RecordingExecutor(StepExecutor):
+    """Test helper StepExecutor that records calls and forwards to InProcessExecutor."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any], float | None]] = []
+
+    async def execute(
+        self,
+        spec: ToolSpec,
+        inputs: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+    ) -> Any:
+        self.calls.append((spec.name, dict(inputs), timeout_s))
+        return await InProcessExecutor().execute(spec, inputs, timeout_s=timeout_s)
+
+
+@pytest.mark.asyncio
+async def test_register_map_tool_custom_executor() -> None:
+    """register_map_tool uses the provided StepExecutor for each item."""
+    reg = ToolRegistry()
+
+    @reg.tool(name="double_num")
+    def double_num(n: int) -> int:
+        return n * 2
+
+    rec_executor = RecordingExecutor()
+    map_spec = register_map_tool(
+        reg,
+        base_tool_name="double_num",
+        item_arg="n",
+        executor=rec_executor,
+        per_item_timeout_s=5.0,
+    )
+
+    res = await map_spec.fn(items=[10, 20, 30])
+    assert res == {"results": [20, 40, 60], "count": 3}
+
+    assert len(rec_executor.calls) == 3
+    assert rec_executor.calls[0] == ("double_num", {"n": 10}, 5.0)
+    assert rec_executor.calls[1] == ("double_num", {"n": 20}, 5.0)
+    assert rec_executor.calls[2] == ("double_num", {"n": 30}, 5.0)
+
+
+@pytest.mark.asyncio
+async def test_register_map_tool_per_item_timeout() -> None:
+    """register_map_tool enforces per_item_timeout_s on mapped item execution."""
+    reg = ToolRegistry()
+
+    @reg.tool(name="slow_tool")
+    async def slow_tool(delay: float) -> str:
+        await asyncio.sleep(delay)
+        return f"waited {delay}s"
+
+    map_spec = register_map_tool(
+        reg,
+        base_tool_name="slow_tool",
+        item_arg="delay",
+        per_item_timeout_s=0.03,
+    )
+
+    # Item finishes faster than per_item_timeout_s
+    fast_res = await map_spec.fn(items=[0.005, 0.01])
+    assert fast_res["count"] == 2
+
+    # Item takes longer than per_item_timeout_s
+    with pytest.raises(TimeoutError) as exc_info:
+        await map_spec.fn(items=[0.1])
+    assert "exceeded timeout" in str(exc_info.value)
+
+
+def test_register_map_tool_invalid_timeout() -> None:
+    """Non-positive per_item_timeout_s raises ValueError."""
+    reg = ToolRegistry()
+
+    @reg.tool(name="ping")
+    def ping(msg: str) -> str:
+        return msg
+
+    with pytest.raises(ValueError) as exc1:
+        register_map_tool(reg, "ping", item_arg="msg", per_item_timeout_s=0.0)
+    assert "greater than 0" in str(exc1.value)
+
+    with pytest.raises(ValueError) as exc2:
+        register_map_tool(reg, "ping", item_arg="msg", per_item_timeout_s=-2.5)
+    assert "greater than 0" in str(exc2.value)
+
+
+@pytest.mark.asyncio
+async def test_register_map_tool_policy_refused_destructive() -> None:
+    """A DESTRUCTIVE base tool mapped under Autonomy.AUTONOMOUS is refused without approver."""
+    reg = ToolRegistry()
+
+    @reg.tool(name="wipe_db", risk=Risk.DESTRUCTIVE)
+    def wipe_db(db_name: str) -> str:
+        return f"wiped {db_name}"
+
+    autonomous_policy = Policy(autonomy=Autonomy.AUTONOMOUS)
+    map_spec = register_map_tool(
+        reg,
+        base_tool_name="wipe_db",
+        item_arg="db_name",
+        policy=autonomous_policy,
+    )
+
+    with pytest.raises(CalbiError) as exc_info:
+        await map_spec.fn(items=["db_dev", "db_staging"])
+    assert "requires approval by policy, but no approver configured" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_register_map_tool_policy_denied() -> None:
+    """Tool denied by policy is rejected when map tool executes."""
+    reg = ToolRegistry()
+
+    @reg.tool(name="blocked_tool")
+    def blocked(x: int) -> int:
+        return x
+
+    policy = Policy(denied_tools={"blocked_tool"})
+    map_spec = register_map_tool(
+        reg,
+        base_tool_name="blocked_tool",
+        item_arg="x",
+        policy=policy,
+    )
+
+    with pytest.raises(CalbiError) as exc_info:
+        await map_spec.fn(items=[1, 2])
+    assert "denied by policy" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_register_map_tool_policy_approver_flow() -> None:
+    """Policy approver callback is invoked for items requiring approval."""
+    reg = ToolRegistry()
+
+    @reg.tool(name="deploy_service", risk=Risk.DEPLOY, requires_approval=True)
+    def deploy_service(service: str) -> str:
+        return f"deployed {service}"
+
+    approved_items: list[str] = []
+
+    async def approver_callback(req: ApprovalRequest) -> bool:
+        srv = str(req.inputs.get("service"))
+        if srv == "malicious_service":
+            return False
+        approved_items.append(srv)
+        return True
+
+    policy = Policy(autonomy=Autonomy.CONTROLLED, approver=approver_callback)
+    map_spec = register_map_tool(
+        reg,
+        base_tool_name="deploy_service",
+        item_arg="service",
+        policy=policy,
+    )
+
+    # 1. Approval granted for all items
+    ok_res = await map_spec.fn(items=["frontend", "backend"])
+    assert ok_res["count"] == 2
+    assert "frontend" in approved_items
+    assert "backend" in approved_items
+
+    # 2. Approval rejected for malicious_service
+    with pytest.raises(CalbiError) as exc_info:
+        await map_spec.fn(items=["malicious_service"])
+    assert "Approval denied" in str(exc_info.value)
