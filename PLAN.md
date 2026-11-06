@@ -378,9 +378,415 @@ Each WP lists: Owns · Depends on · Tasks · Acceptance tests (must exist and p
 - [x] Autonomy levels 0–3 behave per the table
 - [x] Docs and examples present, CI green
 
-## 8. Later (V0.2+)
+## 8. Phase 2 (V0.2) — Parallel Feature Branch Plan
 
-Level 4 strategy experimentation (run candidate strategies in dry-run/parallel and compare), loops and sub-playbooks, process/container executor, reference LLM adapters (OpenAI, Anthropic, Gemini), embedding-based memory retrieval, improvement proposals with human review, OpenTelemetry export, split into three distributions.
+V0.1 is complete on `main`. Phase 2 (V0.2) is architected so **6 agents can work concurrently on separate `feat/*` branches with zero file collisions**.
+
+> **Status (2026-11-06): Wave 1 DONE.** WP-12..WP-17 merged to `main` via PRs #1–#6 (`db7f512` → `c8cf8f7`), zero conflicts. `main`: 235 offline tests pass, `ruff check`, `ruff format --check`, `mypy src` clean, CI green on Python 3.10–3.13. The new modules are **not yet wired** into `Calbi` / `Runtime` / `delegate_loop` — see §8.5–§8.7 for what's next.
+
+### 8.1 Branching & Collision-Free Rules
+
+1. **One Branch per Feature**: Every agent must branch directly off `main`:
+   ```bash
+   git checkout main && git pull origin main
+   git checkout -b <branch-name>
+   ```
+2. **Strict Disjoint File Ownership (Wave 1)**:
+   - In **Wave 1**, no two branches touch the same file.
+   - Wave 1 branches **MUST NOT** edit shared wiring files (`src/calbi/__init__.py`, `src/calbi/core/engine.py`, `src/calbi/core/runtime.py`, `src/calbi/core/schema.py`, `src/calbi/ai/delegate.py`, `pyproject.toml`).
+   - Instead, each Wave 1 branch builds its module as a self-contained unit tested against existing V0.1 public interfaces (`Playbook`, `Runtime`, `ToolRegistry`, `EventBus`, `MemoryStore`, `Planner`, `Verifier`).
+3. **Wave 2 Wiring (`feat/v0.2-integration`)**:
+   - Once the Wave 1 PRs are merged into `main`, a single short Wave 2 branch wires the new modules into `Calbi`, `Runtime`, `delegate_loop`, and `__init__.py`.
+
+```
+                         ┌─► feat/adaptive-strategies     (WP-12) ─┐
+                         ├─► feat/self-improvement        (WP-13) ─┤
+                         ├─► feat/sandbox-executor        (WP-14) ─┤
+main (v0.1.0 complete) ──┼─► feat/observability-redaction (WP-15) ─┼──► Merge to main ──► feat/v0.2-integration (WP-18)
+                         ├─► feat/subplaybooks-foreach    (WP-16) ─┤
+                         └─► feat/live-benchmarks         (WP-17) ─┘
+```
+
+### 8.2 File Ownership Matrix (Wave 1 — Zero Overlap)
+
+| Branch | WP | Exclusive Code Files Owned | Exclusive Test & Doc Files Owned | Shared Files Touched |
+| --- | --- | --- | --- | --- |
+| `feat/adaptive-strategies` | WP-12 | `src/calbi/ai/strategies.py` | `tests/ai/test_strategies.py`, `docs/adaptive-strategies.md` | **None** |
+| `feat/self-improvement` | WP-13 | `src/calbi/memory/improvement.py` | `tests/memory/test_improvement.py`, `docs/self-improvement.md` | **None** |
+| `feat/sandbox-executor` | WP-14 | `src/calbi/core/executor.py` | `tests/core/test_executor.py`, `docs/sandboxing.md` | **None** |
+| `feat/observability-redaction` | WP-15 | `src/calbi/core/observability.py` | `tests/core/test_observability.py`, `docs/observability.md` | **None** |
+| `feat/subplaybooks-foreach` | WP-16 | `src/calbi/core/composition.py` | `tests/core/test_composition.py`, `docs/composition.md` | **None** |
+| `feat/live-benchmarks` | WP-17 | `examples/live_neon_openrouter.py` | `tests/live/test_live_e2e_delegation.py`, `tests/memory/test_memory_contract.py`, `docs/model-compat.md` | **None** |
+
+---
+
+### 8.3 Wave 1 Work Packages & Contracts
+
+#### WP-12 — Autonomy Level 4: Adaptive Strategy Experimentation
+- **Branch**: `feat/adaptive-strategies`
+- **Owns**: `src/calbi/ai/strategies.py`, `tests/ai/test_strategies.py`, `docs/adaptive-strategies.md`
+- **Contract**:
+  ```python
+  @dataclass
+  class StrategyCandidate:
+      name: str
+      rationale: str
+      playbook: Playbook
+      validation: ValidationReport
+
+
+  @dataclass
+  class StrategyTrial:
+      candidate: StrategyCandidate
+      run: RunState | None
+      verdict: Verdict | None
+      score: float  # 0.0..1.0 composite of verdict.confidence, step efficiency, risk
+
+
+  @dataclass
+  class StrategyExplorationResult:
+      winner: StrategyTrial | None
+      trials: list[StrategyTrial]
+      total_attempts: int
+
+
+  class StrategyExplorationFailed(CalbiError): ...
+
+
+  class StrategyExplorer:
+      def __init__(
+          self,
+          llm: LLM,
+          registry: ToolRegistry,
+          policy: Policy,
+          runtime: Runtime | None = None,
+          verifier: Verifier | None = None,
+          max_candidates: int = 3,
+      ) -> None: ...
+
+      async def generate_candidates(
+          self,
+          task: str,
+          inputs: dict[str, Any] | None = None,
+          constraints: Sequence[str] = (),
+          k: int = 3,
+      ) -> list[StrategyCandidate]: ...
+
+      async def explore(
+          self,
+          task: str,
+          inputs: dict[str, Any] | None = None,
+          constraints: Sequence[str] = (),
+          expected_output: str | None = None,
+          *,
+          mode: Literal["sequential", "parallel_read_only"] = "sequential",
+      ) -> StrategyExplorationResult: ...
+  ```
+- **Behaviour**:
+  - `generate_candidates` prompts the LLM to produce `k` distinct strategies (different tool chains or parameters; structural signatures must differ). Each candidate is validated via `validate(...)`; invalid candidates are discarded.
+  - `explore(..., mode="sequential")` tries candidate 1, verifies it, and stops early if `verdict.passed` with `confidence >= 0.8`; otherwise tries candidate 2, etc., and picks the highest-scoring passing trial.
+  - `explore(..., mode="parallel_read_only")` runs candidates concurrently **only** for candidates whose `validation.max_risk == Risk.READ` (any candidate with `max_risk > Risk.READ` is rejected from parallel dry-run to prevent side-effects).
+  - Never bypasses `Policy`: all candidate runs execute through `Runtime` with `policy` enforced.
+- **Accept (`tests/ai/test_strategies.py`)**:
+  - Generates 3 distinct valid candidates with `FakeLLM`; duplicate candidate signatures are deduplicated.
+  - Sequential mode: strategy A fails, strategy B passes → winner is B, strategy C is not executed.
+  - Parallel read-only mode: runs two `Risk.READ` candidates concurrently and picks the higher confidence winner.
+  - Candidate with `Risk.WRITE` or `Risk.DESTRUCTIVE` in `parallel_read_only` mode is skipped/refused before execution.
+
+---
+
+#### WP-13 — Self-Improvement & Playbook Promotion Proposals
+- **Branch**: `feat/self-improvement`
+- **Owns**: `src/calbi/memory/improvement.py`, `tests/memory/test_improvement.py`, `docs/self-improvement.md`
+- **Contract**:
+  ```python
+  class ProposalStatus(str, Enum):
+      PENDING = "pending"
+      APPROVED = "approved"
+      REJECTED = "rejected"
+
+
+  class ImprovementProposal(BaseModel):
+      proposal_id: str
+      task: str
+      baseline_playbook: Playbook | None
+      proposed_playbook: Playbook
+      rationale: str
+      evidence_run_ids: list[str]
+      steps_saved: int
+      risk_delta: int  # negative = lower risk, 0 = same, positive = higher risk
+      status: ProposalStatus = ProposalStatus.PENDING
+      created_at: datetime
+
+
+  class ImprovementManager:
+      def __init__(
+          self, memory: MemoryStore, llm: LLM | None = None, min_runs_for_reusable: int = 5
+      ) -> None: ...
+      def evaluate_improvement(
+          self,
+          task: str,
+          baseline: Playbook | None,
+          candidate: Playbook,
+          run: RunState,
+          verdict: Verdict,
+      ) -> ImprovementProposal | None: ...
+      def list_proposals(self, status: ProposalStatus | None = None) -> list[ImprovementProposal]: ...
+      def approve(self, proposal_id: str) -> PlaybookRecord: ...
+      def reject(self, proposal_id: str, reason: str = "") -> ImprovementProposal: ...
+  ```
+- **Behaviour**:
+  - Distinguishes **succeeded** (1 run) vs **validated** (≥3 runs) vs **reusable** (approved proposal or ≥`min_runs_for_reusable` with 0 failures).
+  - `evaluate_improvement` creates a `PENDING` `ImprovementProposal` when a succeeded+verified run either: (a) succeeded after a replan where the initial baseline failed, or (b) achieved the objective in fewer steps or strictly lower `max_risk` than an existing `validated` playbook for the same task.
+  - **One run never auto-promotes to `reusable`** without an explicit `approve(proposal_id)` call.
+  - `approve(proposal_id)` saves/promotes the playbook to `"reusable"` in `MemoryStore` and marks the proposal `APPROVED`.
+- **Accept (`tests/memory/test_improvement.py`)**:
+  - Single successful run does not become `reusable` automatically.
+  - Replanned run that succeeded creates a `PENDING` proposal recording the baseline and proposed playbook.
+  - Faster/lower-risk playbook creates a proposal with accurate `steps_saved` and `risk_delta`.
+  - `approve()` promotes the record in `SQLiteMemory` to `"reusable"` so `find_similar()` returns it; `reject()` leaves it unpromoted.
+
+---
+
+#### WP-14 — Sandboxed Step Executor (In-Process & Subprocess Isolation)
+- **Branch**: `feat/sandbox-executor`
+- **Owns**: `src/calbi/core/executor.py`, `tests/core/test_executor.py`, `docs/sandboxing.md`
+- **Contract**:
+  ```python
+  class ExecutionIsolationError(CalbiError): ...
+
+
+  class StepExecutor(Protocol):
+      async def execute(
+          self,
+          spec: ToolSpec,
+          inputs: dict[str, Any],
+          *,
+          timeout_s: float | None = None,
+      ) -> Any: ...
+
+
+  class InProcessExecutor:
+      """Default executor running async tools on the loop and sync tools via asyncio.to_thread."""
+
+      async def execute(
+          self, spec: ToolSpec, inputs: dict[str, Any], *, timeout_s: float | None = None
+      ) -> Any: ...
+
+
+  class SubprocessExecutor:
+      """Runs top-level importable tool functions in an isolated child Python process."""
+
+      def __init__(
+          self,
+          *,
+          allowed_env_keys: set[str] = frozenset({"PATH", "LANG", "LC_ALL", "SYSTEMROOT"}),
+          max_output_bytes: int = 1_048_576,
+      ) -> None: ...
+      async def execute(
+          self, spec: ToolSpec, inputs: dict[str, Any], *, timeout_s: float | None = None
+      ) -> Any: ...
+  ```
+- **Behaviour**:
+  - `calbi.core` rule: must not import `calbi.ai` or `calbi.memory`.
+  - `InProcessExecutor` matches current runtime behavior (async coroutine or `asyncio.to_thread`), enforcing `timeout_s` and JSON serializability.
+  - `SubprocessExecutor` spawns `sys.executable -c ...` via `asyncio.create_subprocess_exec`, passes JSON-serialized `inputs` over `stdin`, reads JSON result from `stdout`, and **scrubs `os.environ`** so secrets (`OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, `DATABASE_URL`, etc.) are NOT leaked to child tool processes unless listed in `allowed_env_keys`.
+  - If the child process exceeds `timeout_s`, kills the process (`proc.kill()`) and raises `TimeoutError`.
+  - If the tool is a local closure/lambda (not importable by module+qualname), raises `ExecutionIsolationError` with a clear message.
+- **Accept (`tests/core/test_executor.py`)**:
+  - `InProcessExecutor` runs sync and async tools and enforces timeout.
+  - `SubprocessExecutor` executes a top-level tool function in a separate PID (assert `os.getpid()` returned by tool != parent `os.getpid()`).
+  - Secret env var set in parent process (`os.environ["SECRET_KEY"] = "xyz"`) is absent inside `SubprocessExecutor` child process.
+  - Infinite sleep in `SubprocessExecutor` is killed on timeout without hanging test suite.
+  - Non-JSON output or non-zero exit raises `ExecutionIsolationError`.
+
+---
+
+#### WP-15 — Event Redaction, Secret Scrubbing & Observability Sinks
+- **Branch**: `feat/observability-redaction`
+- **Owns**: `src/calbi/core/observability.py`, `tests/core/test_observability.py`, `docs/observability.md`
+- **Contract**:
+  ```python
+  class Redactor:
+      def __init__(
+          self,
+          *,
+          max_string_bytes: int = 2048,
+          sensitive_keys: set[str] = frozenset(
+              {"api_key", "password", "secret", "token", "authorization", "dsn", "database_url"}
+          ),
+          extra_patterns: Sequence[re.Pattern[str]] = (),
+      ) -> None: ...
+      def redact(self, value: Any) -> Any: ...
+      def redact_event(self, event: Event) -> Event: ...
+
+
+  class JSONLEventSink:
+      """Subscriber that writes redacted JSONL events to a file path or TextIO stream."""
+
+      def __init__(self, target: Path | TextIO, redactor: Redactor | None = None) -> None: ...
+      def __call__(self, event: Event) -> None: ...
+
+
+  class SpanRecord(BaseModel):
+      trace_id: str
+      span_id: str
+      parent_span_id: str | None
+      name: str
+      start_ts: datetime
+      end_ts: datetime | None
+      status: Literal["ok", "error", "in_progress"]
+      attributes: dict[str, Any]
+
+
+  class TraceCollector:
+      """Builds hierarchical run -> step spans from EventBus events (OTel-compatible structure, zero extra deps)."""
+
+      def __init__(self, redactor: Redactor | None = None) -> None: ...
+      def __call__(self, event: Event) -> None: ...
+      @property
+      def spans(self) -> list[SpanRecord]: ...
+  ```
+- **Behaviour**:
+  - `Redactor.redact` recursively walks dicts/lists/strings:
+    - Any dict key matching `sensitive_keys` (case-insensitive substring match for `secret`, `token`, `password`, `api_key`, `dsn`) has its value replaced with `"[REDACTED]"`.
+    - Scrubs known inline patterns in strings: Bearer tokens (`Bearer [A-Za-z0-9._-]+`), Postgres DSN passwords (`postgresql://user:pass@` → `postgresql://user:[REDACTED]@`), `sk-...`, `nvapi-...`.
+    - Truncates strings longer than `max_string_bytes` (default 2048 bytes per §5.7) with `"... [truncated]"`.
+  - `JSONLEventSink` and `TraceCollector` attach directly to `EventBus.subscribe(...)`.
+- **Accept (`tests/core/test_observability.py`)**:
+  - Dicts with `api_key`, `DATABASE_URL`, Bearer headers, and `postgresql://user:secret@host/db` are scrubbed in `redact_event`.
+  - Strings > 2 KB are truncated to 2 KB + suffix.
+  - `JSONLEventSink` subscribed to `EventBus` writes valid redacted JSONL lines to `tmp_path`.
+  - `TraceCollector` pairs `run.started`/`run.completed` and `step.started`/`step.completed` into parent-child `SpanRecord` objects.
+
+---
+
+#### WP-16 — Sub-Playbooks & Bounded `for_each` Composition
+- **Branch**: `feat/subplaybooks-foreach`
+- **Owns**: `src/calbi/core/composition.py`, `tests/core/test_composition.py`, `docs/composition.md`
+- **Contract**:
+  ```python
+  class SubPlaybookError(CalbiError): ...
+
+
+  def register_subplaybook(
+      registry: ToolRegistry,
+      playbook: Playbook,
+      runtime: Runtime,
+      *,
+      name: str | None = None,
+      description: str | None = None,
+      max_depth: int = 3,
+  ) -> ToolSpec:
+      """Register a Playbook as a reusable tool in ToolRegistry."""
+
+
+  def register_map_tool(
+      registry: ToolRegistry,
+      base_tool_name: str,
+      *,
+      name: str | None = None,
+      items_param: str = "items",
+      item_arg: str,
+      max_items: int = 50,
+      max_concurrency: int = 8,
+  ) -> ToolSpec:
+      """Register a batched for-each tool that maps base_tool over a list of items concurrently."""
+  ```
+- **Behaviour**:
+  - `register_subplaybook` computes the effective `risk` of the sub-playbook as the maximum `Risk` of all steps in `playbook`, derives `input_schema` from `playbook.inputs`, and registers an async tool that runs `runtime.run(playbook, inputs=...)` and returns `run_state.outputs` (raising `SubPlaybookError` if the sub-playbook fails or recursion exceeds `max_depth`).
+  - `register_map_tool` wraps an existing registered tool (`base_tool_name`) into a new tool that accepts `items: list[Any]` (plus any static kwargs), enforces `len(items) <= max_items`, runs `base_tool` concurrently bounded by `max_concurrency`, and returns `{"results": [...], "count": len(items)}`. Inherits `risk` and `requires_approval` from `base_tool`.
+- **Accept (`tests/core/test_composition.py`)**:
+  - Sub-playbook registered as a tool can be invoked as a step inside a parent playbook; outputs pass cleanly to downstream parent steps.
+  - Sub-playbook containing a `Risk.DESTRUCTIVE` step automatically gets `risk=Risk.DESTRUCTIVE` on its registered `ToolSpec`.
+  - Recursive sub-playbook exceeding `max_depth` raises `SubPlaybookError`.
+  - `register_map_tool` processes a list of 5 items concurrently and rejects lists exceeding `max_items`.
+
+---
+
+#### WP-17 — Live Service E2E Suite & Shared Memory Contract Tests
+- **Branch**: `feat/live-benchmarks`
+- **Owns**: `tests/memory/test_memory_contract.py`, `tests/live/test_live_e2e_delegation.py`, `examples/live_neon_openrouter.py`, `docs/model-compat.md`
+- **Tasks**:
+  1. Create a parametrized contract test suite in `tests/memory/test_memory_contract.py` that runs all `MemoryStore` invariants (`save_run`, single-run stays `succeeded`, 3-run auto-promotion to `validated`, `promote` to `reusable`, `find_similar`, `record_failure`, `tool_limitations`) against `SQLiteMemory` offline and against `PostgresMemory` (in a throwaway schema `calbi_test_<uuid>`) when `DATABASE_URL` is set.
+  2. Create `tests/live/test_live_e2e_delegation.py` (marked `@pytest.mark.live`):
+     - Tests real `Planner.plan` on OpenRouter and/or NVIDIA NIM for the dataset scenario, asserting `report.ok is True` within 3 attempts.
+     - Tests full `engine.adelegate` end-to-end with replanning (first tool raises an error, model replans to fallback tool and verifies).
+  3. Create `examples/live_neon_openrouter.py` demonstrating `llm_from_env()` + `PostgresMemory` with graceful fallback to `FakeLLM` + `SQLiteMemory` when env vars are unset (so `python examples/live_neon_openrouter.py` works both offline in CI and live with `.env`).
+- **Accept**:
+  - `pytest -m "not live"` runs the full `test_memory_contract.py` against SQLite and passes.
+  - `python examples/live_neon_openrouter.py` runs cleanly offline without env vars.
+  - Live tests skip cleanly when `OPENROUTER_API_KEY` / `NVIDIA_API_KEY` / `DATABASE_URL` are absent, and pass when present.
+
+---
+
+### 8.4 Wave 1 Post-Merge Review (2026-11-06)
+
+Tests pass, but a review of the merged code found gaps that the Wave 1 tests don't cover. Fix these **before** wiring the modules into the engine (§8.6), so integration builds on hardened pieces.
+
+| # | Module | Finding | Severity |
+| --- | --- | --- | --- |
+| R1 | `core/composition.py` | `register_subplaybook` silently skips steps whose tool isn't registered yet (`except UnknownToolError: pass`), so the computed risk can be **lower than the real risk** → a destructive step can be laundered behind a `READ` wrapper. Must fail closed. | High |
+| R2 | `core/composition.py` | `register_map_tool` calls `base_spec.fn` directly, bypassing runtime policy, per-step timeout, and (later) the executor. | High |
+| R3 | `core/composition.py` | Writes to private `registry._tools`. Needs a public `ToolRegistry` API. | Medium |
+| R4 | `core/executor.py` | `SubprocessExecutor` uses `proc.communicate()`, which buffers **all** stdout before the `max_output_bytes` check → a misbehaving tool can exhaust parent memory. Tool `print()` output also shares the JSON result channel and corrupts it. | High |
+| R5 | `core/executor.py`, `docs/sandboxing.md` | Docs should say clearly this is *process + env isolation*, not a security sandbox (same user, filesystem, network). | Medium |
+| R6 | `core/observability.py` | Key matching is substring-based, so `max_tokens`, `tokens_used`, `token_count` get redacted (false positives that hide useful telemetry). | Medium |
+| R7 | `core/observability.py` | `TraceCollector` keys step spans by `(run_id, step_id)`; on retries the earlier attempt's span is orphaned in `in_progress` forever. | Low |
+| R8 | `memory/improvement.py` | Proposals live only in an in-process dict → lost on restart; cannot be approved from another process. | High |
+| R9 | `memory/improvement.py` | Optimization trigger compares against `find_similar(task)[0]`, which may be a *different* task's playbook (FTS similarity), producing misleading `steps_saved`. | Medium |
+| R10 | `ai/strategies.py` | `generate_candidates` hard-codes `expected_output` in the prompt instead of passing the caller's value; uses private `Risk._rank`. | Low |
+| R11 | CI | No `fail-fast: false` (one failed matrix job cancels others, as seen on PR #3); Node 20 deprecation for `actions/checkout@v4` / `setup-python@v5`; the "separate live CI job" from the decision log doesn't exist; `mypy` runs on `src` only; `asyncio_default_fixture_loop_scope` unset (pytest-asyncio warning). | Medium |
+| R12 | Repo | Merged `feat/*` branches still on `origin`; version is still `0.1.0`. | Low |
+
+### 8.5 Wave 2A — Hardening (parallel, zero file overlap)
+
+Same rules as §8.1: branch off `main`, touch only owned files, one PR per branch, CI green before merge. Hub files (`__init__.py`, `engine.py`, `runtime.py`, `schema.py`, `delegate.py`) stay untouched until Wave 2B.
+
+| Branch | WP | Fixes | Owns |
+| --- | --- | --- | --- |
+| `fix/composition-hardening` | WP-19 | R1, R2, R3 | `src/calbi/core/composition.py`, `src/calbi/core/registry.py`, `tests/core/test_composition.py`, `tests/core/test_registry.py`, `docs/composition.md` |
+| `fix/executor-hardening` | WP-20 | R4, R5 | `src/calbi/core/executor.py`, `tests/core/test_executor.py`, `docs/sandboxing.md` |
+| `fix/observability-hardening` | WP-21 | R6, R7 | `src/calbi/core/observability.py`, `tests/core/test_observability.py`, `docs/observability.md` |
+| `fix/improvement-persistence` | WP-22 | R8, R9 | `src/calbi/memory/improvement.py`, `src/calbi/memory/base.py`, `src/calbi/memory/sqlite.py`, `src/calbi/memory/postgres.py`, `tests/memory/test_improvement.py`, `tests/memory/test_memory_contract.py`, `docs/self-improvement.md` |
+| `fix/strategies-polish` | WP-23 | R10 | `src/calbi/ai/strategies.py`, `tests/ai/test_strategies.py` |
+| `chore/ci-hygiene` | WP-24 | R11 | `.github/workflows/ci.yml`, `pyproject.toml` (`[tool.pytest]` / `[tool.mypy]` sections only), `tests/memory/test_postgres_memory.py` |
+
+**Acceptance per WP:**
+- **WP-19**: Add public `ToolRegistry.add_spec(spec)` (raises `DuplicateToolError`); composition never touches `_tools`. Registering a sub-playbook that references an unregistered tool raises `SubPlaybookError` (fail closed). The map tool runs each item through policy (`Policy.decide`) and honors the base tool's timeout; a `DESTRUCTIVE` base tool under `Autonomy.AUTONOMOUS` is refused, same as a direct step.
+- **WP-20**: Read child stdout incrementally; kill the child and raise `ExecutionIsolationError` as soon as `max_output_bytes` is exceeded (test: a tool emitting 50 MB is killed; parent RSS stays bounded). The result travels on a dedicated channel (e.g. a length-prefixed frame or a separate pipe), so `print()` inside a tool doesn't break parsing. `docs/sandboxing.md` gets a "Threat model / non-goals" section.
+- **WP-21**: Sensitive-key matching uses exact names plus delimiter-aware tokens (`api_key`, `x-api-key`, `db_password` match; `max_tokens`, `tokens_used` don't). Retry attempts produce one span per attempt; superseded attempts close with `status="error"`.
+- **WP-22**: Add `save_proposal` / `get_proposal` / `list_proposals` / `update_proposal_status` to `MemoryStore` (SQLite + Postgres, with migration); `ImprovementManager` persists through it. Contract tests cover proposal round-trip on both backends. The optimization trigger only compares against records whose normalized task matches.
+- **WP-23**: The caller's `expected_output` reaches the prompt; scoring uses public `Risk` comparisons only.
+- **WP-24**: `fail-fast: false`; actions bumped to Node 24-compatible majors; a `live` job runs on `workflow_dispatch` / nightly using repo secrets (`OPENROUTER_API_KEY`, `NVIDIA_API_KEY`, `DATABASE_URL`) and skips cleanly when absent; `mypy src tests` clean; `asyncio_default_fixture_loop_scope = "function"` set.
+
+> [!NOTE]
+> WP-22 is the only package that touches the memory backends, and WP-24 fixes the `postgres.time` mypy issue from the **test** side, so the two don't collide.
+
+### 8.6 Wave 2B — Integration (after all of Wave 2A merges)
+
+#### WP-18 — V0.2 Facade & Runtime Wiring
+- **Branch**: `feat/v0.2-integration` (branch from `main` **only after** WP-19..WP-24 are merged)
+- **Owns**: `src/calbi/__init__.py`, `src/calbi/core/runtime.py`, `src/calbi/core/engine.py`, `src/calbi/core/events.py`, `src/calbi/ai/delegate.py`, `tests/e2e/test_v02_integrated.py`, `README.md`
+- **Tasks**:
+  1. Add `executor: StepExecutor | None = None` to `Runtime.__init__` (default `InProcessExecutor()`); runtime delegates tool invocation (including timeout) to it.
+  2. Add `redactor: Redactor | None = None` to `EventBus.__init__` so emitted events are redacted before reaching any subscriber.
+  3. In `delegate_loop`: when `autonomy == Autonomy.ADAPTIVE`, use `StrategyExplorer` for initial planning and replanning; after a verified run with `engine.memory` present, call `ImprovementManager.evaluate_improvement`.
+  4. Expose `Calbi(executor=..., redactor=..., trace=...)` and `engine.proposals` (list / approve / reject).
+  5. Export new public symbols from `calbi` (`StepExecutor`, `InProcessExecutor`, `SubprocessExecutor`, `Redactor`, `JSONLEventSink`, `TraceCollector`, `register_subplaybook`, `register_map_tool`, `StrategyExplorer`, `ImprovementManager`).
+- **Accept (`tests/e2e/test_v02_integrated.py`)**:
+  - Full e2e combining `Autonomy.ADAPTIVE`, `SubprocessExecutor`, `Redactor`, `SQLiteMemory`, and `ImprovementManager`: strategy tournament picks a winner, run executes in a child process, events on the bus contain no secrets, a proposal is persisted, and `approve()` makes it retrievable by `find_similar`.
+  - Existing 235 tests still pass unchanged.
+
+### 8.7 Release & Later
+
+1. **V0.2.0 release** (`chore/release-0.2.0`, after WP-18): bump `pyproject.toml` version, add `CHANGELOG.md`, tag `v0.2.0`, delete merged `feat/*` / `fix/*` branches.
+2. **V0.3 candidates** (unscheduled; each needs a plan entry before work starts):
+   - Embedding-based retrieval in memory (optional `[embeddings]` extra), keeping FTS5 as default.
+   - Token / cost budgets per run, enforced by the runtime alongside step limits.
+   - Approval callbacks (webhook / async hook) so `requires_approval` steps can pause and resume across processes.
+   - Optional OpenTelemetry exporter extra (`[otel]`) on top of `TraceCollector`.
+   - Stronger sandbox backend (container / nsjail) behind the same `StepExecutor` protocol.
 
 ## 9. Decision log
 
