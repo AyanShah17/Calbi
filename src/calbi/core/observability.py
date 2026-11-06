@@ -5,11 +5,21 @@ import threading
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from typing import Any, Literal, Protocol, TextIO, runtime_checkable
 
 from pydantic import BaseModel, Field
 
 from calbi.core.events import Event
+
+
+@runtime_checkable
+class EventSink(Protocol):
+    """Protocol for event sinks/subscribers that process runtime events."""
+
+    def __call__(self, event: Event) -> None:
+        """Handle an emitted runtime event."""
+        ...
+
 
 DEFAULT_ALLOWED_KEYS: frozenset[str] = frozenset(
     {
@@ -457,6 +467,7 @@ class TraceCollector:
 
 __all__ = [
     "DEFAULT_ALLOWED_KEYS",
+    "EventSink",
     "JSONLEventSink",
     "Redactor",
     "SpanRecord",

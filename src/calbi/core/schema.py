@@ -17,6 +17,13 @@ class SchemaError(CalbiError):
     """Raised when a playbook schema fails validation or parsing."""
 
 
+class _RiskRank(int):
+    """Integer rank that is also callable as a method returning int."""
+
+    def __call__(self) -> int:
+        return int(self)
+
+
 class Risk(str, Enum):
     """Risk levels ordered from lowest to highest risk."""
 
@@ -28,7 +35,8 @@ class Risk(str, Enum):
     DEPLOY = "deploy"
 
     @property
-    def _rank(self) -> int:
+    def rank(self) -> _RiskRank:
+        """Integer rank of the risk level from 1 (READ) to 6 (DEPLOY)."""
         ranks = {
             Risk.READ: 1,
             Risk.WRITE: 2,
@@ -37,7 +45,11 @@ class Risk(str, Enum):
             Risk.FINANCIAL: 5,
             Risk.DEPLOY: 6,
         }
-        return ranks[self]
+        return _RiskRank(ranks[self])
+
+    @property
+    def _rank(self) -> _RiskRank:
+        return self.rank
 
     def __lt__(self, other: Any) -> bool:
         if isinstance(other, Risk):

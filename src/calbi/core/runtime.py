@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from calbi.core.events import Event, EventBus
+from calbi.core.executor import ExecutionIsolationError, InProcessExecutor, StepExecutor
 from calbi.core.policy import ApprovalRequest, Autonomy, Policy
 from calbi.core.registry import ToolRegistry
 from calbi.core.schema import CalbiError, FailurePolicy, Playbook, Step
@@ -37,15 +38,17 @@ class Runtime:
 
     def __init__(
         self,
-        registry: ToolRegistry,
-        policy: Policy,
+        registry: ToolRegistry | None = None,
+        policy: Policy | None = None,
         events: EventBus | None = None,
         max_concurrency: int = 8,
+        executor: StepExecutor | None = None,
     ) -> None:
-        self.registry = registry
-        self.policy = policy
+        self.registry = registry if registry is not None else ToolRegistry()
+        self.policy = policy if policy is not None else Policy()
         self.events = events or EventBus()
         self.max_concurrency = max_concurrency
+        self.executor: StepExecutor = executor if executor is not None else InProcessExecutor()
         self._active_runs: dict[str, asyncio.Event] = {}  # run_id -> cancel_event
 
     async def cancel(self, run_id: str) -> None:
@@ -336,11 +339,6 @@ class Runtime:
                     )
 
                     try:
-                        if tool_spec.is_async:
-                            coro = tool_spec.fn(**rendered_step_inputs)
-                        else:
-                            coro = asyncio.to_thread(tool_spec.fn, **rendered_step_inputs)
-
                         now = time.perf_counter()
                         rem_budget = self.policy.max_runtime_s - (now - start_time)
                         if rem_budget <= 0:
@@ -354,7 +352,16 @@ class Runtime:
                         else:
                             effective_timeout = rem_budget
 
-                        output = await asyncio.wait_for(coro, timeout=effective_timeout)
+                        try:
+                            output = await self.executor.execute(
+                                tool_spec,
+                                rendered_step_inputs,
+                                timeout_s=effective_timeout,
+                            )
+                        except ExecutionIsolationError as eie:
+                            if "JSON-serializable" in str(eie):
+                                raise UnserializableOutput(str(eie)) from eie
+                            raise
 
                         # Verify JSON serializability
                         try:
@@ -552,3 +559,14 @@ class Runtime:
         )
 
         return run_state
+
+
+Runner = Runtime
+
+__all__ = [
+    "BudgetExceeded",
+    "Runner",
+    "Runtime",
+    "UnserializableOutput",
+    "ValidationFailed",
+]
