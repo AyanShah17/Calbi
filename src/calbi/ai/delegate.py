@@ -61,15 +61,42 @@ async def delegate_loop(
             for lim in engine.memory.tool_limitations(tool_spec.name):
                 memory_hints.append(f"Tool '{tool_spec.name}' limitation/failure: {lim}")
 
-    plan_result = await planner.plan(
-        task=task,
-        inputs=inputs,
-        constraints=constraints,
-        expected_output=expected_output,
-        hints=memory_hints,
-        templates=memory_templates,
-    )
-    current_playbook = plan_result.playbook
+    if getattr(engine, "explore", False) or engine.policy.autonomy == Autonomy.ADAPTIVE:
+        from calbi.ai.strategies import StrategyExplorer
+
+        explorer = StrategyExplorer(
+            llm=engine.llm,
+            registry=engine.registry,
+            policy=engine.policy,
+        )
+        exploration_result = await explorer.explore(
+            task=task,
+            inputs=inputs,
+            constraints=constraints,
+            expected_output=expected_output,
+        )
+        if exploration_result.winner is not None:
+            current_playbook = exploration_result.winner.candidate.playbook
+        else:
+            plan_result = await planner.plan(
+                task=task,
+                inputs=inputs,
+                constraints=constraints,
+                expected_output=expected_output,
+                hints=memory_hints,
+                templates=memory_templates,
+            )
+            current_playbook = plan_result.playbook
+    else:
+        plan_result = await planner.plan(
+            task=task,
+            inputs=inputs,
+            constraints=constraints,
+            expected_output=expected_output,
+            hints=memory_hints,
+            templates=memory_templates,
+        )
+        current_playbook = plan_result.playbook
     report.plans.append(current_playbook)
 
     # 2. Check Autonomy Level 0 (Advisory)
@@ -188,6 +215,17 @@ async def delegate_loop(
             run=run_state,
         )
         if verdict.passed:
+            if getattr(engine, "auto_propose_improvements", False):
+                mgr = engine.improvement_manager
+                if mgr is not None:
+                    baseline_pb = attempts_history[0] if len(attempts_history) > 1 else None
+                    mgr.evaluate_improvement(
+                        candidate=current_playbook,
+                        run=run_state,
+                        verdict=verdict,
+                        task=task,
+                        baseline=baseline_pb,
+                    )
             if engine.memory is not None:
                 engine.memory.save_run(task, current_playbook, run_state, verdict)
             report.duration_s = time.time() - start_time

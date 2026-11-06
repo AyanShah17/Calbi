@@ -150,6 +150,16 @@ class ToolRegistry:
     # Alias tool to register for convenience (@registry.tool(...))
     tool = register
 
+    def add_spec(self, spec: ToolSpec) -> None:
+        """Add a pre-constructed ToolSpec directly to the registry.
+
+        Raises:
+            DuplicateToolError: If a tool with the same name is already registered.
+        """
+        if spec.name in self._tools:
+            raise DuplicateToolError(f"Tool with name '{spec.name}' is already registered.")
+        self._tools[spec.name] = spec
+
     def register_tools(self, fns: Iterable[Callable[..., Any]]) -> None:
         """Register multiple callable tools."""
         for fn in fns:
