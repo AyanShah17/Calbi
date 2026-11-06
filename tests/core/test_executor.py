@@ -81,9 +81,60 @@ def exit_with_code(code: int = 42) -> None:
 
 
 def corrupt_stdout_tool() -> None:
-    """Write invalid non-JSON data directly to stdout."""
+    """Write invalid non-JSON data directly to stdout and exit immediately without sentinels."""
     sys.stdout.write("THIS_IS_DEFINITELY_NOT_JSON!!!\n")
     sys.stdout.flush()
+    os._exit(0)
+
+
+def tool_with_incidental_stdout_prints() -> dict[str, Any]:
+    """Tool that produces incidental debug prints before returning."""
+    print("DEBUG: entering tool function")
+    sys.stdout.write("THIS_IS_INCIDENTAL_PRINT_OUTPUT!!!\n")
+    print("DEBUG: finishing tool function")
+    return {"success": True, "answer": 42}
+
+
+def tool_with_atexit_noise() -> str:
+    """Tool that registers an atexit handler to print noise AFTER the child runner's sentinel."""
+    import atexit
+
+    def _after_cleanup() -> None:
+        sys.stdout.write("TRAILING NOISE AFTER SENTINEL\n")
+        sys.stdout.flush()
+
+    atexit.register(_after_cleanup)
+    print("LEADING NOISE BEFORE SENTINEL")
+    return "payload_with_noise_before_and_after"
+
+
+def stream_50mb_tool() -> None:
+    """Tool that emits ~50MB of data on stdout to test streaming byte cap."""
+    chunk = "X" * 65536
+    for _ in range(800):  # ~52 MB
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+
+
+def infinite_stdout_tool() -> None:
+    """Tool that infinitely prints to stdout until killed."""
+    while True:
+        sys.stdout.write("A" * 1024)
+        sys.stdout.flush()
+
+
+def emit_corrupt_sentinel_json_tool() -> None:
+    """Tool that writes invalid JSON inside valid sentinels and exits immediately."""
+    sys.stdout.write("\n__CALBI_OUTPUT_START__\n{bad_json_not_quoted:\n__CALBI_OUTPUT_END__\n")
+    sys.stdout.flush()
+    os._exit(0)
+
+
+def emit_missing_end_sentinel_tool() -> None:
+    """Tool that writes start sentinel without end sentinel and exits immediately."""
+    sys.stdout.write('\n__CALBI_OUTPUT_START__\n{"foo": "bar"}\n')
+    sys.stdout.flush()
+    os._exit(0)
 
 
 def failing_tool(msg: str = "child failure") -> None:
@@ -488,3 +539,132 @@ async def test_subprocess_rejects_unserializable_inputs() -> None:
     with pytest.raises(ExecutionIsolationError) as exc_info:
         await executor.execute(spec, {"a": 1, "b": object()})
     assert "inputs are not JSON-serializable" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_incidental_stdout_prints_succeed() -> None:
+    """Verify incidental print() output from user tool does not corrupt JSON parsing."""
+    executor = SubprocessExecutor()
+    spec = ToolSpec(
+        name="tool_with_incidental_stdout_prints",
+        description="prints noise and returns result",
+        fn=tool_with_incidental_stdout_prints,
+        is_async=False,
+        input_schema={"type": "object"},
+    )
+
+    result = await executor.execute(spec, {})
+    assert result == {"success": True, "answer": 42}
+
+
+@pytest.mark.asyncio
+async def test_subprocess_sentinel_framed_with_noise_before_and_after() -> None:
+    """Verify sentinel framing works when noise is emitted before and after sentinel payload."""
+    executor = SubprocessExecutor()
+    spec = ToolSpec(
+        name="tool_with_atexit_noise",
+        description="noise before and after sentinel",
+        fn=tool_with_atexit_noise,
+        is_async=False,
+        input_schema={"type": "object"},
+    )
+
+    result = await executor.execute(spec, {})
+    assert result == "payload_with_noise_before_and_after"
+
+
+@pytest.mark.asyncio
+async def test_subprocess_streaming_output_cap_kills_child_bounded_memory() -> None:
+    """Verify tool emitting 50MB is killed incrementally without buffering entire stream."""
+    executor = SubprocessExecutor(max_output_bytes=64 * 1024)
+    spec = ToolSpec(
+        name="stream_50mb_tool",
+        description="emits 50MB",
+        fn=stream_50mb_tool,
+        is_async=False,
+        input_schema={"type": "object"},
+    )
+
+    start = time.perf_counter()
+    with pytest.raises(ExecutionIsolationError) as exc_info:
+        await executor.execute(spec, {})
+    duration = time.perf_counter() - start
+
+    assert "exceeded maximum allowed size" in str(exc_info.value)
+    # Child was killed promptly without waiting for all 50MB to be generated/buffered
+    assert duration < 5.0
+
+
+@pytest.mark.asyncio
+async def test_subprocess_streaming_output_cap_infinite_loop() -> None:
+    """Verify tool infinitely printing to stdout is terminated by byte cap."""
+    executor = SubprocessExecutor(max_output_bytes=1024)
+    spec = ToolSpec(
+        name="infinite_stdout_tool",
+        description="infinite stdout printer",
+        fn=infinite_stdout_tool,
+        is_async=False,
+        input_schema={"type": "object"},
+    )
+
+    start = time.perf_counter()
+    with pytest.raises(ExecutionIsolationError) as exc_info:
+        await executor.execute(spec, {}, timeout_s=5.0)
+    duration = time.perf_counter() - start
+
+    assert "exceeded maximum allowed size" in str(exc_info.value)
+    assert duration < 2.0
+
+
+@pytest.mark.asyncio
+async def test_subprocess_byte_cap_exact_boundary() -> None:
+    """Verify byte cap allows exact boundary output and rejects exceeding output."""
+    executor_ok = SubprocessExecutor(max_output_bytes=5000)
+    spec = ToolSpec(
+        name="large_output_tool",
+        description="large output",
+        fn=large_output_tool,
+        is_async=False,
+        input_schema={"type": "object"},
+    )
+    res = await executor_ok.execute(spec, {"size": 2000})
+    assert len(res) == 2000
+
+    executor_capped = SubprocessExecutor(max_output_bytes=500)
+    with pytest.raises(ExecutionIsolationError) as exc_info:
+        await executor_capped.execute(spec, {"size": 2000})
+    assert "exceed" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_subprocess_malformed_json_inside_sentinels_raises_isolation_error() -> None:
+    """Verify malformed JSON inside valid sentinels raises ExecutionIsolationError."""
+    executor = SubprocessExecutor()
+    spec = ToolSpec(
+        name="emit_corrupt_sentinel_json_tool",
+        description="bad json in sentinel",
+        fn=emit_corrupt_sentinel_json_tool,
+        is_async=False,
+        input_schema={"type": "object"},
+    )
+
+    with pytest.raises(ExecutionIsolationError) as exc_info:
+        await executor.execute(spec, {})
+    assert "invalid JSON output" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_missing_start_or_end_sentinel_raises_isolation_error() -> None:
+    """Verify missing end sentinel raises ExecutionIsolationError."""
+    executor = SubprocessExecutor()
+    spec = ToolSpec(
+        name="emit_missing_end_sentinel_tool",
+        description="missing end sentinel",
+        fn=emit_missing_end_sentinel_tool,
+        is_async=False,
+        input_schema={"type": "object"},
+    )
+
+    with pytest.raises(ExecutionIsolationError) as exc_info:
+        await executor.execute(spec, {})
+    assert "missing sentinel framing" in str(exc_info.value)
