@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import dataclasses
+import difflib
+import json
+import re
+import sqlite3
+import string
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -69,6 +77,24 @@ def _compute_playbook_risk(playbook: Playbook, registry: ToolRegistry | None = N
     return max_risk
 
 
+def normalize_task(task: str) -> str:
+    """Normalize a task string: case-folded, punctuation normalized, whitespace collapsed."""
+    text = task.casefold().strip()
+    text = re.sub(r"[" + re.escape(string.punctuation) + r"]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def task_similarity(task1: str, task2: str) -> float:
+    """Compute normalized similarity ratio in [0.0, 1.0] between two tasks."""
+    norm1 = normalize_task(task1)
+    norm2 = normalize_task(task2)
+    if norm1 == norm2:
+        return 1.0
+    if not norm1 or not norm2:
+        return 0.0
+    return difflib.SequenceMatcher(None, norm1, norm2).ratio()
+
+
 class ImprovementManager:
     """Manages playbook evolution proposals, evaluating optimizations and gating promotion."""
 
@@ -78,13 +104,222 @@ class ImprovementManager:
         llm: LLM | None = None,
         min_runs_for_reusable: int = 5,
         registry: ToolRegistry | None = None,
+        storage_path: Path | str | None = None,
+        db_path: Path | str | None = None,
+        similarity_threshold: float = 0.85,
+        min_similarity_threshold: float | None = None,
     ) -> None:
         self.memory = memory
         self.llm = llm
         self.min_runs_for_reusable = min_runs_for_reusable
         self.registry = registry
+        self.similarity_threshold = (
+            min_similarity_threshold
+            if min_similarity_threshold is not None
+            else similarity_threshold
+        )
+        resolved_path = db_path if db_path is not None else storage_path
+        if isinstance(resolved_path, str) and resolved_path != ":memory:":
+            self.storage_path: Path | str | None = Path(resolved_path)
+        else:
+            self.storage_path = resolved_path
+
         self._proposals: dict[str, ImprovementProposal] = {}
         self._proposal_runs: dict[str, tuple[RunState, Verdict]] = {}
+        self._conn: sqlite3.Connection | None = None
+        self._storage_type: str | None = None
+
+        if self.storage_path is not None:
+            if isinstance(self.storage_path, Path) and self.storage_path.suffix == ".json":
+                self._storage_type = "json"
+                self._load_from_json()
+            else:
+                self._storage_type = "sqlite"
+                if isinstance(self.storage_path, Path):
+                    self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+                self._conn = sqlite3.connect(
+                    str(self.storage_path),
+                    isolation_level=None,
+                )
+                self._init_sqlite_db()
+                self._load_from_sqlite()
+
+    def _init_sqlite_db(self) -> None:
+        if self._conn is None:
+            return
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS improvement_proposals (
+                proposal_id TEXT PRIMARY KEY,
+                task TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                proposal_json TEXT NOT NULL,
+                run_json TEXT,
+                verdict_json TEXT
+            );
+            """
+        )
+
+    def _load_from_sqlite(self) -> None:
+        if self._conn is None:
+            return
+        cur = self._conn.cursor()
+        cur.execute(
+            """
+            SELECT proposal_id, proposal_json, run_json, verdict_json
+            FROM improvement_proposals
+            """
+        )
+        for row in cur.fetchall():
+            pid, prop_json, run_json, verd_json = row
+            proposal = ImprovementProposal.model_validate_json(prop_json)
+            self._proposals[pid] = proposal
+            if run_json and verd_json:
+                try:
+                    run = RunState.model_validate_json(run_json)
+                    verdict_data = json.loads(verd_json)
+                    verdict = Verdict(**verdict_data)
+                    self._proposal_runs[pid] = (run, verdict)
+                except Exception:
+                    pass
+
+    def _load_from_json(self) -> None:
+        if not isinstance(self.storage_path, Path) or not self.storage_path.exists():
+            return
+        try:
+            content = self.storage_path.read_text(encoding="utf-8")
+            if not content.strip():
+                return
+            data = json.loads(content)
+            for item in data.get("proposals", []):
+                prop = ImprovementProposal.model_validate(item)
+                self._proposals[prop.proposal_id] = prop
+            for pid, r_info in data.get("runs", {}).items():
+                run = RunState.model_validate(r_info["run"])
+                verdict = Verdict(**r_info["verdict"])
+                self._proposal_runs[pid] = (run, verdict)
+        except Exception:
+            pass
+
+    def _save_to_json(self) -> None:
+        if not isinstance(self.storage_path, Path):
+            return
+        data = {
+            "proposals": [p.model_dump(mode="json") for p in self._proposals.values()],
+            "runs": {
+                pid: {
+                    "run": run.model_dump(mode="json"),
+                    "verdict": dataclasses.asdict(verd),
+                }
+                for pid, (run, verd) in self._proposal_runs.items()
+            },
+        }
+        tmp_file = self.storage_path.with_suffix(".tmp")
+        tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp_file.replace(self.storage_path)
+
+    def _save_proposal(
+        self,
+        proposal: ImprovementProposal,
+        run: RunState | None = None,
+        verdict: Verdict | None = None,
+    ) -> None:
+        self._proposals[proposal.proposal_id] = proposal
+        if run is not None and verdict is not None:
+            self._proposal_runs[proposal.proposal_id] = (run, verdict)
+
+        if self.storage_path is None:
+            return
+
+        if self._storage_type == "sqlite" and self._conn is not None:
+            run_info = self._proposal_runs.get(proposal.proposal_id)
+            run_json = run_info[0].model_dump_json() if run_info else None
+            verd_json = json.dumps(dataclasses.asdict(run_info[1])) if run_info else None
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO improvement_proposals (
+                    proposal_id, task, status, created_at, proposal_json, run_json, verdict_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    proposal.proposal_id,
+                    proposal.task,
+                    proposal.status.value,
+                    proposal.created_at.isoformat(),
+                    proposal.model_dump_json(),
+                    run_json,
+                    verd_json,
+                ),
+            )
+        elif self._storage_type == "json":
+            self._save_to_json()
+
+    def _find_best_memory_match(
+        self,
+        task: str,
+        limit: int = 10,
+    ) -> tuple[PlaybookRecord | None, float]:
+        """Find best matching validated or reusable playbook record from memory.
+
+        Prefers exact normalized task match. If none, falls back to records meeting
+        the similarity threshold.
+        """
+        candidates = self.memory.find_similar(task, limit=limit)
+        if not candidates:
+            return None, 0.0
+
+        norm_task = normalize_task(task)
+        # 1. Exact normalized match
+        for rec in candidates:
+            if normalize_task(rec.task) == norm_task:
+                return rec, 1.0
+
+        # 2. Similarity threshold match
+        best_rec: PlaybookRecord | None = None
+        best_sim = 0.0
+        for rec in candidates:
+            sim = task_similarity(rec.task, task)
+            if sim > best_sim:
+                best_sim = sim
+                best_rec = rec
+
+        if best_sim >= self.similarity_threshold:
+            return best_rec, best_sim
+
+        return None, best_sim
+
+    def _find_matching_proposal(
+        self,
+        task: str,
+        status: ProposalStatus = ProposalStatus.PENDING,
+    ) -> tuple[ImprovementProposal | None, float]:
+        """Find existing proposal matching task by normalized match or similarity threshold."""
+        norm_task = normalize_task(task)
+        # 1. Prefer exact normalized match
+        for prop in self._proposals.values():
+            if prop.status != status:
+                continue
+            if normalize_task(prop.task) == norm_task:
+                return prop, 1.0
+
+        # 2. Minimum similarity threshold
+        best_prop: ImprovementProposal | None = None
+        best_sim = 0.0
+        for prop in self._proposals.values():
+            if prop.status != status:
+                continue
+            sim = task_similarity(prop.task, task)
+            if sim > best_sim:
+                best_sim = sim
+                best_prop = prop
+
+        if best_sim >= self.similarity_threshold:
+            return best_prop, best_sim
+
+        return None, best_sim
 
     def evaluate_improvement(
         self,
@@ -119,17 +354,38 @@ class ImprovementManager:
             steps_saved = len(baseline.steps) - len(candidate.steps)
             risk_delta = candidate_risk._rank - baseline_risk._rank
 
-            # Check if an identical pending proposal already exists to aggregate evidence
-            for prop in self._proposals.values():
-                if (
-                    prop.status == ProposalStatus.PENDING
-                    and prop.task == task
-                    and prop.proposed_playbook == candidate
-                    and prop.baseline_playbook == baseline
+            # Check if a matching pending proposal already exists
+            existing_prop, _ = self._find_matching_proposal(task, ProposalStatus.PENDING)
+            if existing_prop is not None:
+                # Same candidate playbook: aggregate evidence
+                if existing_prop.proposed_playbook == candidate:
+                    if run.run_id and run.run_id not in existing_prop.evidence_run_ids:
+                        existing_prop.evidence_run_ids.append(run.run_id)
+                        self._save_proposal(existing_prop)
+                    return existing_prop
+
+                # Different candidate: update/overwrite only if new candidate improves steps or risk
+                if steps_saved > existing_prop.steps_saved or (
+                    steps_saved == existing_prop.steps_saved
+                    and risk_delta < existing_prop.risk_delta
                 ):
-                    if run.run_id and run.run_id not in prop.evidence_run_ids:
-                        prop.evidence_run_ids.append(run.run_id)
-                    return prop
+                    existing_prop.proposed_playbook = candidate
+                    existing_prop.baseline_playbook = baseline
+                    existing_prop.steps_saved = steps_saved
+                    existing_prop.risk_delta = risk_delta
+                    existing_prop.rationale = (
+                        f"Replan recovery (updated): candidate playbook succeeded with "
+                        f"{len(candidate.steps)} steps (risk: {candidate_risk.value}) after "
+                        f"baseline failed ({len(baseline.steps)} steps, "
+                        f"risk: {baseline_risk.value}). "
+                        f"Steps saved: {steps_saved}, Risk delta: {risk_delta}."
+                    )
+                    if run.run_id and run.run_id not in existing_prop.evidence_run_ids:
+                        existing_prop.evidence_run_ids.append(run.run_id)
+                    self._save_proposal(existing_prop, run=run, verdict=verdict)
+                    return existing_prop
+                else:
+                    return existing_prop
 
             proposal_id = f"prop_{uuid.uuid4().hex[:12]}"
             rationale = (
@@ -150,14 +406,12 @@ class ImprovementManager:
                 status=ProposalStatus.PENDING,
                 created_at=datetime.now(timezone.utc),
             )
-            self._proposals[proposal_id] = proposal
-            self._proposal_runs[proposal_id] = (run, verdict)
+            self._save_proposal(proposal, run=run, verdict=verdict)
             return proposal
 
         # Trigger B: Optimization against existing validated or reusable playbooks in memory
-        similar_records = self.memory.find_similar(task, limit=1)
-        if similar_records:
-            existing_rec = similar_records[0]
+        existing_rec, _ = self._find_best_memory_match(task, limit=10)
+        if existing_rec is not None:
             existing_pb = existing_rec.playbook
             existing_risk = _compute_playbook_risk(existing_pb, self.registry)
 
@@ -166,18 +420,48 @@ class ImprovementManager:
 
             # Optimization condition: fewer steps OR lower risk
             if steps_saved > 0 or risk_delta < 0:
-                for prop in self._proposals.values():
-                    if (
-                        prop.status == ProposalStatus.PENDING
-                        and prop.task == task
-                        and prop.proposed_playbook == candidate
+                existing_prop, _ = self._find_matching_proposal(task, ProposalStatus.PENDING)
+                if existing_prop is not None:
+                    if existing_prop.proposed_playbook == candidate:
+                        if run.run_id and run.run_id not in existing_prop.evidence_run_ids:
+                            existing_prop.evidence_run_ids.append(run.run_id)
+                            self._save_proposal(existing_prop)
+                        return existing_prop
+
+                    if steps_saved > existing_prop.steps_saved or (
+                        steps_saved == existing_prop.steps_saved
+                        and risk_delta < existing_prop.risk_delta
                     ):
-                        if run.run_id and run.run_id not in prop.evidence_run_ids:
-                            prop.evidence_run_ids.append(run.run_id)
-                        return prop
+                        existing_prop.proposed_playbook = candidate
+                        existing_prop.baseline_playbook = existing_pb
+                        existing_prop.steps_saved = steps_saved
+                        existing_prop.risk_delta = risk_delta
+                        rationale_parts: list[str] = []
+                        if steps_saved > 0:
+                            rationale_parts.append(
+                                f"saves {steps_saved} step(s) "
+                                f"({len(existing_pb.steps)} -> {len(candidate.steps)})"
+                            )
+                        if risk_delta < 0:
+                            rationale_parts.append(
+                                f"reduces risk from {existing_risk.value} to "
+                                f"{candidate_risk.value} (delta: {risk_delta})"
+                            )
+
+                        existing_prop.rationale = (
+                            f"Playbook optimization: candidate achieves task with "
+                            f"{', '.join(rationale_parts)} compared to existing "
+                            f"{existing_rec.status} playbook (record {existing_rec.record_id})."
+                        )
+                        if run.run_id and run.run_id not in existing_prop.evidence_run_ids:
+                            existing_prop.evidence_run_ids.append(run.run_id)
+                        self._save_proposal(existing_prop, run=run, verdict=verdict)
+                        return existing_prop
+                    else:
+                        return existing_prop
 
                 proposal_id = f"prop_{uuid.uuid4().hex[:12]}"
-                rationale_parts: list[str] = []
+                rationale_parts = []
                 if steps_saved > 0:
                     rationale_parts.append(
                         f"saves {steps_saved} step(s) "
@@ -206,8 +490,7 @@ class ImprovementManager:
                     status=ProposalStatus.PENDING,
                     created_at=datetime.now(timezone.utc),
                 )
-                self._proposals[proposal_id] = proposal
-                self._proposal_runs[proposal_id] = (run, verdict)
+                self._save_proposal(proposal, run=run, verdict=verdict)
                 return proposal
 
             # Trigger C: Reusable qualification based on min_runs_for_reusable
@@ -221,15 +504,14 @@ class ImprovementManager:
                     tool_errors.extend(self.memory.tool_limitations(step.tool))
 
                 if not tool_errors:
-                    for prop in self._proposals.values():
-                        if (
-                            prop.status == ProposalStatus.PENDING
-                            and prop.task == task
-                            and prop.proposed_playbook == candidate
-                        ):
-                            if run.run_id and run.run_id not in prop.evidence_run_ids:
-                                prop.evidence_run_ids.append(run.run_id)
-                            return prop
+                    existing_prop, _ = self._find_matching_proposal(task, ProposalStatus.PENDING)
+                    if existing_prop is not None:
+                        if existing_prop.proposed_playbook == candidate:
+                            if run.run_id and run.run_id not in existing_prop.evidence_run_ids:
+                                existing_prop.evidence_run_ids.append(run.run_id)
+                                self._save_proposal(existing_prop)
+                            return existing_prop
+                        return existing_prop
 
                     proposal_id = f"prop_{uuid.uuid4().hex[:12]}"
                     rationale = (
@@ -249,8 +531,7 @@ class ImprovementManager:
                         status=ProposalStatus.PENDING,
                         created_at=datetime.now(timezone.utc),
                     )
-                    self._proposals[proposal_id] = proposal
-                    self._proposal_runs[proposal_id] = (run, verdict)
+                    self._save_proposal(proposal, run=run, verdict=verdict)
                     return proposal
 
         # No improvement or promotion criteria met; single successful run does not auto-promote
@@ -279,6 +560,7 @@ class ImprovementManager:
             raise KeyError(f"Improvement proposal '{proposal_id}' not found.")
 
         proposal.status = ProposalStatus.APPROVED
+        self._save_proposal(proposal)
 
         # Ensure run state is available for memory.save_run
         run_info = self._proposal_runs.get(proposal_id)
@@ -332,4 +614,31 @@ class ImprovementManager:
 
         proposal.status = ProposalStatus.REJECTED
         proposal.rejection_reason = reason
+        self._save_proposal(proposal)
         return proposal
+
+    def close(self) -> None:
+        """Close any open database connections."""
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def __enter__(self) -> ImprovementManager:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
