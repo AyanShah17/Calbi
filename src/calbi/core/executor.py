@@ -65,6 +65,9 @@ class InProcessExecutor:
         return result
 
 
+_OUTPUT_START_SENTINEL = "__CALBI_OUTPUT_START__"
+_OUTPUT_END_SENTINEL = "__CALBI_OUTPUT_END__"
+
 _CHILD_RUNNER_CODE = """
 import asyncio
 import importlib
@@ -72,6 +75,9 @@ import inspect
 import json
 import os
 import sys
+
+_START_SENTINEL = "__CALBI_OUTPUT_START__"
+_END_SENTINEL = "__CALBI_OUTPUT_END__"
 
 def _run() -> None:
     try:
@@ -118,7 +124,7 @@ def _run() -> None:
             )
             sys.exit(2)
 
-        sys.stdout.write(encoded)
+        sys.stdout.write(f"\\n{_START_SENTINEL}\\n{encoded}\\n{_END_SENTINEL}\\n")
         sys.stdout.flush()
     except Exception:
         import traceback
@@ -128,6 +134,89 @@ def _run() -> None:
 if __name__ == "__main__":
     _run()
 """
+
+
+async def _feed_stdin(proc: asyncio.subprocess.Process, payload: bytes) -> None:
+    if proc.stdin is None:
+        return
+    try:
+        proc.stdin.write(payload)
+        await proc.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+            await proc.stdin.wait_closed()
+        except (BrokenPipeError, ConnectionResetError, Exception):
+            pass
+
+
+async def _read_stdout_stream(
+    proc: asyncio.subprocess.Process,
+    max_output_bytes: int,
+) -> tuple[bytes, bool]:
+    """Stream stdout from proc up to hard cap max_output_bytes + 1.
+
+    If output exceeds max_output_bytes, kill proc and return (received_bytes, True).
+    """
+    if proc.stdout is None:
+        return b"", False
+
+    chunks: list[bytes] = []
+    total_bytes = 0
+    exceeded = False
+    hard_cap = max_output_bytes + 1
+
+    while True:
+        to_read = min(65536, hard_cap - total_bytes)
+        if to_read <= 0:
+            exceeded = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            break
+
+        chunk = await proc.stdout.read(to_read)
+        if not chunk:
+            break
+
+        chunks.append(chunk)
+        total_bytes += len(chunk)
+
+        if total_bytes > max_output_bytes:
+            exceeded = True
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            break
+
+    return b"".join(chunks), exceeded
+
+
+async def _read_stderr_stream(
+    proc: asyncio.subprocess.Process,
+    max_bytes: int = 65536,
+) -> bytes:
+    """Read stderr from proc up to max_bytes, discarding extra to avoid unbounded memory."""
+    if proc.stderr is None:
+        return b""
+
+    chunks: list[bytes] = []
+    total = 0
+
+    while True:
+        chunk = await proc.stderr.read(65536)
+        if not chunk:
+            break
+        if total < max_bytes:
+            take = min(len(chunk), max_bytes - total)
+            chunks.append(chunk[:take])
+            total += take
+
+    return b"".join(chunks)
 
 
 class SubprocessExecutor:
@@ -222,28 +311,41 @@ class SubprocessExecutor:
                 f"Failed to spawn child process for tool '{spec.name}': {exc}"
             ) from exc
 
+        stdin_task = asyncio.create_task(_feed_stdin(proc, payload))
+        stdout_task = asyncio.create_task(_read_stdout_stream(proc, self.max_output_bytes))
+        stderr_task = asyncio.create_task(_read_stderr_stream(proc, 65536))
+
         try:
             if timeout_s is not None:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(input=payload),
+                (stdout_bytes, exceeded), stderr_bytes = await asyncio.wait_for(
+                    asyncio.gather(stdout_task, stderr_task),
                     timeout=timeout_s,
                 )
             else:
-                stdout_bytes, stderr_bytes = await proc.communicate(input=payload)
+                (stdout_bytes, exceeded), stderr_bytes = await asyncio.gather(
+                    stdout_task, stderr_task
+                )
         except (asyncio.TimeoutError, TimeoutError) as exc:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
             await proc.wait()
+            stdin_task.cancel()
+            stdout_task.cancel()
+            stderr_task.cancel()
             raise TimeoutError(
                 f"Tool '{spec.name}' subprocess exceeded timeout of {timeout_s}s"
             ) from exc
+        finally:
+            if not stdin_task.done():
+                stdin_task.cancel()
+            await proc.wait()
 
-        if len(stdout_bytes) > self.max_output_bytes:
+        if exceeded or len(stdout_bytes) > self.max_output_bytes:
             raise ExecutionIsolationError(
                 f"Tool '{spec.name}' output exceeded maximum allowed size of "
-                f"{self.max_output_bytes} bytes (received {len(stdout_bytes)} bytes)."
+                f"{self.max_output_bytes} bytes (received at least {len(stdout_bytes)} bytes)."
             )
 
         if proc.returncode != 0:
@@ -255,7 +357,30 @@ class SubprocessExecutor:
 
         try:
             decoded = stdout_bytes.decode("utf-8")
-            result = json.loads(decoded)
+        except UnicodeDecodeError as exc:
+            raise ExecutionIsolationError(
+                f"Tool '{spec.name}' subprocess produced invalid JSON output: {exc}"
+            ) from exc
+
+        start_idx = decoded.rfind(_OUTPUT_START_SENTINEL)
+        if start_idx == -1:
+            raise ExecutionIsolationError(
+                f"Tool '{spec.name}' subprocess produced invalid JSON output: "
+                "missing sentinel framing."
+            )
+
+        payload_start = start_idx + len(_OUTPUT_START_SENTINEL)
+        end_idx = decoded.find(_OUTPUT_END_SENTINEL, payload_start)
+        if end_idx == -1:
+            raise ExecutionIsolationError(
+                f"Tool '{spec.name}' subprocess produced invalid JSON output: "
+                "missing sentinel framing."
+            )
+
+        json_str = decoded[payload_start:end_idx].strip()
+
+        try:
+            result = json.loads(json_str)
         except Exception as exc:
             raise ExecutionIsolationError(
                 f"Tool '{spec.name}' subprocess produced invalid JSON output: {exc}"
