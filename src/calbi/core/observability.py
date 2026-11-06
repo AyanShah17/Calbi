@@ -11,6 +11,33 @@ from pydantic import BaseModel, Field
 
 from calbi.core.events import Event
 
+DEFAULT_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "max_tokens",
+        "tokens_used",
+        "token_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "tokens",
+        "token_budget",
+        "tokens_budget",
+        "cached_tokens",
+        "reasoning_tokens",
+        "prompt_token_count",
+        "candidates_token_count",
+        "total_token_count",
+        "tokens_remaining",
+        "num_tokens",
+        "token_usage",
+        "tokens_total",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+    }
+)
+
 
 class Redactor:
     """Recursively redacts sensitive keys, scrubs credentials, and caps payload byte length."""
@@ -30,10 +57,12 @@ class Redactor:
                 "database_url",
             }
         ),
+        allowed_keys: frozenset[str] | set[str] = DEFAULT_ALLOWED_KEYS,
         extra_patterns: Sequence[re.Pattern[str]] = (),
     ) -> None:
         self.max_string_bytes = max_string_bytes
-        self.sensitive_keys = {k.lower() for k in sensitive_keys}
+        self.sensitive_keys = {self._normalize_key(k) for k in sensitive_keys}
+        self.allowed_keys = {self._normalize_key(k) for k in allowed_keys}
         self.extra_patterns = list(extra_patterns)
 
         # Standard credential scrubbing regular expressions
@@ -42,6 +71,39 @@ class Redactor:
         self._api_key_sk_pattern = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
         self._api_key_nv_pattern = re.compile(r"nvapi-[A-Za-z0-9_\-]{8,}")
 
+    @staticmethod
+    def _normalize_key(key: Any) -> str:
+        """Normalize key across camelCase, kebab-case, dots, and underscores."""
+        s = str(key)
+        s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s)
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+        s = re.sub(r"[-.\s:]+", "_", s)
+        return s.lower().strip("_")
+
+    def is_sensitive_key(self, key: Any) -> bool:
+        """Determine if a dictionary key represents sensitive credentials."""
+        norm = self._normalize_key(key)
+        if not norm:
+            return False
+
+        # 1. Non-secret token count/usage allowlist check
+        if norm in self.allowed_keys:
+            return False
+
+        # 2. Check against sensitive keys with delimiter-aware word boundary matching
+        padded_norm = f"_{norm}_"
+        for sens in self.sensitive_keys:
+            if not sens:
+                continue
+            padded_sens = f"_{sens}_"
+            if padded_sens in padded_norm:
+                return True
+            # Support plural tokens for secret tokens (e.g., auth_tokens, api_tokens)
+            if sens == "token" and "_tokens_" in padded_norm:
+                return True
+
+        return False
+
     def redact(self, value: Any) -> Any:
         """Recursively redact values in dicts, lists, sets, tuples, and strings."""
         if isinstance(value, str):
@@ -49,8 +111,7 @@ class Redactor:
         if isinstance(value, dict):
             redacted_dict: dict[str, Any] = {}
             for k, v in value.items():
-                k_lower = str(k).lower()
-                if any(sens in k_lower for sens in self.sensitive_keys):
+                if self.is_sensitive_key(k):
                     redacted_dict[k] = "[REDACTED]"
                 else:
                     redacted_dict[k] = self.redact(v)
@@ -153,7 +214,15 @@ class TraceCollector:
         self.redactor = redactor or Redactor()
         self._spans: dict[str, SpanRecord] = {}
         self._run_spans: dict[str, str] = {}  # run_id -> span_id
-        self._step_spans: dict[tuple[str, str], str] = {}  # (run_id, step_id) -> span_id
+        self._step_spans: dict[
+            tuple[str, str, int], str
+        ] = {}  # (run_id, step_id, attempt) -> span_id
+        self._latest_step_spans: dict[
+            tuple[str, str], str
+        ] = {}  # (run_id, step_id) -> latest span_id
+        self._latest_step_attempts: dict[
+            tuple[str, str], int
+        ] = {}  # (run_id, step_id) -> latest attempt
         self._lock = threading.Lock()
 
     def __call__(self, event: Event) -> None:
@@ -181,10 +250,33 @@ class TraceCollector:
             elif event.type == "step.started":
                 parent_id = self._run_spans.get(event.run_id)
                 step_name = event.step_id or "unknown"
-                step_key = (event.run_id, step_name)
-                attempt = redacted_data.get("attempt", 1)
+                step_pair = (event.run_id, step_name)
+
+                # If prior attempt was still in_progress, close it with status="error"
+                prior_span_id = self._latest_step_spans.get(step_pair)
+                if prior_span_id and prior_span_id in self._spans:
+                    prior_span = self._spans[prior_span_id]
+                    if prior_span.status == "in_progress":
+                        prior_span.end_ts = event.ts
+                        prior_span.status = "error"
+                        prior_span.attributes.setdefault("superseded_by_retry", True)
+
+                # Determine attempt number
+                attempt_val = redacted_data.get("attempt")
+                if attempt_val is not None:
+                    try:
+                        attempt = int(attempt_val)
+                    except (ValueError, TypeError):
+                        attempt = self._latest_step_attempts.get(step_pair, 0) + 1
+                else:
+                    attempt = self._latest_step_attempts.get(step_pair, 0) + 1
+
+                compound_key = (event.run_id, step_name, attempt)
                 child_span_id = f"span_{event.run_id}_{step_name}_{attempt}"
-                self._step_spans[step_key] = child_span_id
+                self._step_spans[compound_key] = child_span_id
+                self._latest_step_spans[step_pair] = child_span_id
+                self._latest_step_attempts[step_pair] = attempt
+
                 self._spans[child_span_id] = SpanRecord(
                     trace_id=event.run_id,
                     span_id=child_span_id,
@@ -195,18 +287,68 @@ class TraceCollector:
                     attributes=redacted_data,
                 )
 
+            elif event.type == "step.retrying":
+                step_name = event.step_id or "unknown"
+                step_pair = (event.run_id, step_name)
+                attempt_val = redacted_data.get("attempt")
+                try:
+                    attempt = (
+                        int(attempt_val)
+                        if attempt_val is not None
+                        else self._latest_step_attempts.get(step_pair, 1)
+                    )
+                except (ValueError, TypeError):
+                    attempt = self._latest_step_attempts.get(step_pair, 1)
+
+                compound_key = (event.run_id, step_name, attempt)
+                span_id = self._step_spans.get(compound_key) or self._latest_step_spans.get(
+                    step_pair
+                )
+                if span_id and span_id in self._spans:
+                    span = self._spans[span_id]
+                    span.end_ts = event.ts
+                    span.status = "error"
+                    span.attributes.update(redacted_data)
+                else:
+                    # Fallback span if step.retrying arrived without step.started
+                    fallback_id = f"span_{event.run_id}_{step_name}_{attempt}"
+                    parent_id = self._run_spans.get(event.run_id)
+                    self._spans[fallback_id] = SpanRecord(
+                        trace_id=event.run_id,
+                        span_id=fallback_id,
+                        parent_span_id=parent_id,
+                        name=f"step:{step_name}",
+                        start_ts=event.ts,
+                        end_ts=event.ts,
+                        status="error",
+                        attributes=redacted_data,
+                    )
+                    self._step_spans[compound_key] = fallback_id
+                    self._latest_step_spans[step_pair] = fallback_id
+                    self._latest_step_attempts[step_pair] = attempt
+
             elif event.type == "step.completed":
                 step_name = event.step_id or "unknown"
-                step_key = (event.run_id, step_name)
-                existing_step_span_id = self._step_spans.get(step_key)
-                if existing_step_span_id and existing_step_span_id in self._spans:
-                    span = self._spans[existing_step_span_id]
+                step_pair = (event.run_id, step_name)
+                attempt_val = redacted_data.get("attempt")
+                span_id = None
+                if attempt_val is not None:
+                    try:
+                        span_id = self._step_spans.get((event.run_id, step_name, int(attempt_val)))
+                    except (ValueError, TypeError):
+                        pass
+                if not span_id:
+                    span_id = self._latest_step_spans.get(step_pair)
+
+                if span_id and span_id in self._spans:
+                    span = self._spans[span_id]
                     span.end_ts = event.ts
                     span.status = "ok"
                     span.attributes.update(redacted_data)
                 else:
                     # Completed without a matching step.started span
-                    fallback_id = f"span_{event.run_id}_{step_name}_completed"
+                    attempt = self._latest_step_attempts.get(step_pair, 1)
+                    fallback_id = f"span_{event.run_id}_{step_name}_{attempt}_completed"
                     parent_id = self._run_spans.get(event.run_id)
                     self._spans[fallback_id] = SpanRecord(
                         trace_id=event.run_id,
@@ -221,16 +363,26 @@ class TraceCollector:
 
             elif event.type == "step.failed":
                 step_name = event.step_id or "unknown"
-                step_key = (event.run_id, step_name)
-                existing_step_span_id = self._step_spans.get(step_key)
-                if existing_step_span_id and existing_step_span_id in self._spans:
-                    span = self._spans[existing_step_span_id]
+                step_pair = (event.run_id, step_name)
+                attempt_val = redacted_data.get("attempt") or redacted_data.get("attempts")
+                span_id = None
+                if attempt_val is not None:
+                    try:
+                        span_id = self._step_spans.get((event.run_id, step_name, int(attempt_val)))
+                    except (ValueError, TypeError):
+                        pass
+                if not span_id:
+                    span_id = self._latest_step_spans.get(step_pair)
+
+                if span_id and span_id in self._spans:
+                    span = self._spans[span_id]
                     span.end_ts = event.ts
                     span.status = "error"
                     span.attributes.update(redacted_data)
                 else:
                     # Failed before started (e.g. denied by policy)
-                    fallback_id = f"span_{event.run_id}_{step_name}_failed"
+                    attempt = self._latest_step_attempts.get(step_pair, 1)
+                    fallback_id = f"span_{event.run_id}_{step_name}_{attempt}_failed"
                     parent_id = self._run_spans.get(event.run_id)
                     self._spans[fallback_id] = SpanRecord(
                         trace_id=event.run_id,
@@ -284,15 +436,27 @@ class TraceCollector:
                 return list(self._spans.values())
             return [s for s in self._spans.values() if s.trace_id == run_id]
 
+    def get_step_spans(self, run_id: str, step_id: str) -> list[SpanRecord]:
+        """Return all attempt spans for a given step in a run."""
+        with self._lock:
+            return [
+                s
+                for s in self._spans.values()
+                if s.trace_id == run_id and s.name == f"step:{step_id}"
+            ]
+
     def clear(self) -> None:
         """Clear all recorded spans."""
         with self._lock:
             self._spans.clear()
             self._run_spans.clear()
             self._step_spans.clear()
+            self._latest_step_spans.clear()
+            self._latest_step_attempts.clear()
 
 
 __all__ = [
+    "DEFAULT_ALLOWED_KEYS",
     "JSONLEventSink",
     "Redactor",
     "SpanRecord",
