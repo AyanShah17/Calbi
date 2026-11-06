@@ -17,6 +17,15 @@ from calbi.core.schema import CalbiError, Playbook, Risk, load_playbook
 from calbi.core.state import RunState, RunStatus
 from calbi.core.validator import ValidationReport, validate
 
+_ORDERED_RISKS = (
+    Risk.READ,
+    Risk.WRITE,
+    Risk.DESTRUCTIVE,
+    Risk.EXTERNAL,
+    Risk.FINANCIAL,
+    Risk.DEPLOY,
+)
+
 
 class StrategyExplorationFailed(CalbiError):
     """Raised when strategy exploration fails to produce viable candidates or trials."""
@@ -86,10 +95,7 @@ INPUT VALUES:
 
 CONSTRAINTS:
 {constraints}
-
-EXPECTED OUTPUT:
 {expected_output}
-
 Output a single JSON object with a "candidates" array containing up to {k} objects in this format:
 {{
   "candidates": [
@@ -206,7 +212,12 @@ class StrategyExplorer:
         step_count = max(1, len(candidate.playbook.steps))
         efficiency = 1.0 / (1.0 + 0.1 * float(step_count))
         max_risk = candidate.validation.max_risk
-        risk_factor = (7.0 - float(max_risk._rank)) / 6.0
+        rank_val = getattr(max_risk, "rank", None)
+        if isinstance(rank_val, (int, float)):
+            risk_rank = float(rank_val)
+        else:
+            risk_rank = float(sum(1 for r in _ORDERED_RISKS if max_risk >= r))
+        risk_factor = (7.0 - risk_rank) / 6.0
         composite = 0.5 * confidence + 0.3 * efficiency + 0.2 * risk_factor
         return round(max(0.0, min(1.0, composite)), 4)
 
@@ -215,6 +226,7 @@ class StrategyExplorer:
         task: str,
         inputs: dict[str, Any] | None = None,
         constraints: Sequence[str] = (),
+        expected_output: str | None = None,
         k: int = 3,
     ) -> list[StrategyCandidate]:
         """Prompt LLM for candidate playbooks, validate each, discard invalid, and deduplicate."""
@@ -244,13 +256,18 @@ class StrategyExplorer:
             hints=hints_text,
         )
 
+        if expected_output is not None and str(expected_output).strip():
+            expected_output_str = f"\nEXPECTED OUTPUT:\n{str(expected_output).strip()}\n"
+        else:
+            expected_output_str = ""
+
         user_msg = STRATEGY_USER_PROMPT.format(
             k=k,
             task=task,
             inputs_schema=json.dumps(inputs_schema, indent=2),
             truncated_inputs=json.dumps(truncated_inputs, indent=2),
             constraints="\n".join(f"- {c}" for c in constraints) if constraints else "None.",
-            expected_output="Complete all task requirements successfully.",
+            expected_output=expected_output_str,
         )
 
         messages = [
@@ -377,6 +394,7 @@ class StrategyExplorer:
             task=task,
             inputs=inputs,
             constraints=constraints,
+            expected_output=expected_output,
             k=self.max_candidates,
         )
 

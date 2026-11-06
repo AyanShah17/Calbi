@@ -563,3 +563,158 @@ def test_playbook_signature_determinism() -> None:
 
     # Different step IDs and different insertion order, but same tools and inputs
     assert _playbook_signature(pb1) == _playbook_signature(pb2)
+
+
+# ---------------------------------------------------------------------------
+# Expected Output Forwarding & Scoring Tests (WP-23 / R10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_with_expected_output_includes_section_in_prompt() -> None:
+    """When expected_output is provided, prompt must explicitly include section and content."""
+    reg, _ = setup_tools()
+    policy = Policy(autonomy=Autonomy.ADAPTIVE)
+
+    cand = _make_candidate_json("strat_1", "data.read_a", {"source": "db"})
+    llm = FakeLLM(responses=[json.dumps({"candidates": [cand]})])
+    explorer = StrategyExplorer(llm=llm, registry=reg, policy=policy)
+
+    target_output = "A Markdown table containing rows with columns: name, count, and status"
+    candidates = await explorer.generate_candidates(
+        task="Generate report",
+        inputs={"source": "db"},
+        expected_output=target_output,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].name == "strat_1"
+    assert len(llm.calls) == 1
+
+    user_msg = [m for m in llm.calls[0].messages if m.role == "user"][0].content
+    assert "EXPECTED OUTPUT:" in user_msg
+    assert target_output in user_msg
+
+
+@pytest.mark.asyncio
+async def test_generate_candidates_omitted_or_none_expected_output_omits_section() -> None:
+    """When expected_output is None or omitted, EXPECTED OUTPUT header is omitted gracefully."""
+    reg, _ = setup_tools()
+    policy = Policy(autonomy=Autonomy.ADAPTIVE)
+
+    cand = _make_candidate_json("strat_1", "data.read_a", {"source": "db"})
+    llm = FakeLLM(
+        responses=[
+            json.dumps({"candidates": [cand]}),
+            json.dumps({"candidates": [cand]}),
+            json.dumps({"candidates": [cand]}),
+        ]
+    )
+    explorer = StrategyExplorer(llm=llm, registry=reg, policy=policy)
+
+    # 1. Completely omitted
+    await explorer.generate_candidates(task="Task 1", inputs={"source": "db"})
+    user_msg_omitted = [m for m in llm.calls[0].messages if m.role == "user"][0].content
+    assert "EXPECTED OUTPUT" not in user_msg_omitted
+
+    # 2. Explicitly None
+    await explorer.generate_candidates(task="Task 2", inputs={"source": "db"}, expected_output=None)
+    user_msg_none = [m for m in llm.calls[1].messages if m.role == "user"][0].content
+    assert "EXPECTED OUTPUT" not in user_msg_none
+
+    # 3. Blank / whitespace string
+    await explorer.generate_candidates(
+        task="Task 3", inputs={"source": "db"}, expected_output="   \n  "
+    )
+    user_msg_blank = [m for m in llm.calls[2].messages if m.role == "user"][0].content
+    assert "EXPECTED OUTPUT" not in user_msg_blank
+
+
+@pytest.mark.asyncio
+async def test_explore_forwards_expected_output_to_candidate_generation() -> None:
+    """StrategyExplorer.explore forwards expected_output to generate_candidates prompt."""
+    reg, _ = setup_tools()
+    policy = Policy(autonomy=Autonomy.ADAPTIVE)
+
+    cand = _make_candidate_json("strat_1", "data.read_a", {"source": "db"})
+    cand_resp = json.dumps({"candidates": [cand]})
+    verifier_resp = json.dumps({"passed": True, "reasons": ["Success"], "confidence": 0.95})
+    llm = FakeLLM(responses=[cand_resp, verifier_resp])
+
+    explorer = StrategyExplorer(llm=llm, registry=reg, policy=policy)
+    target_output = "Normalized records in JSON schema"
+
+    result = await explorer.explore(
+        task="Process dataset",
+        inputs={"source": "db"},
+        expected_output=target_output,
+        mode="sequential",
+    )
+
+    assert result.winner is not None
+    # Verify generate_candidates prompt received expected_output
+    gen_user_msg = [m for m in llm.calls[0].messages if m.role == "user"][0].content
+    assert "EXPECTED OUTPUT:" in gen_user_msg
+    assert target_output in gen_user_msg
+
+    # Verify verifier prompt also received expected_output
+    verifier_user_msg = [m for m in llm.calls[1].messages if m.role == "user"][0].content
+    assert target_output in verifier_user_msg
+
+
+@pytest.mark.asyncio
+async def test_explore_without_expected_output_omits_section_in_prompt() -> None:
+    """StrategyExplorer.explore without expected_output omits EXPECTED OUTPUT section in prompt."""
+    reg, _ = setup_tools()
+    policy = Policy(autonomy=Autonomy.ADAPTIVE)
+
+    cand = _make_candidate_json("strat_1", "data.read_a", {"source": "db"})
+    cand_resp = json.dumps({"candidates": [cand]})
+    verifier_resp = json.dumps({"passed": True, "reasons": ["Success"], "confidence": 0.95})
+    llm = FakeLLM(responses=[cand_resp, verifier_resp])
+
+    explorer = StrategyExplorer(llm=llm, registry=reg, policy=policy)
+
+    result = await explorer.explore(
+        task="Process dataset",
+        inputs={"source": "db"},
+        mode="sequential",
+    )
+
+    assert result.winner is not None
+    gen_user_msg = [m for m in llm.calls[0].messages if m.role == "user"][0].content
+    assert "EXPECTED OUTPUT" not in gen_user_msg
+
+
+def test_calculate_score_public_risk_comparison_all_ranks() -> None:
+    """calculate_score computes correct risk factor using public comparisons across Risk levels."""
+    step = Step(id="s1", tool="data.read_a", inputs={})
+    dummy_pb = Playbook(name="dummy", steps=[step])
+    succeeded_run = RunState(run_id="r1", playbook=dummy_pb, status=RunStatus.SUCCEEDED)
+    verdict = Verdict(passed=True, confidence=1.0)
+
+    # Risk ranking order: READ (1), WRITE (2), DESTRUCTIVE (3), EXTERNAL (4), FINANCIAL (5), DEPLOY
+    expected_risk_factors = {
+        Risk.READ: (7.0 - 1.0) / 6.0,  # 1.0
+        Risk.WRITE: (7.0 - 2.0) / 6.0,  # ~0.8333
+        Risk.DESTRUCTIVE: (7.0 - 3.0) / 6.0,  # ~0.6667
+        Risk.EXTERNAL: (7.0 - 4.0) / 6.0,  # 0.5
+        Risk.FINANCIAL: (7.0 - 5.0) / 6.0,  # ~0.3333
+        Risk.DEPLOY: (7.0 - 6.0) / 6.0,  # ~0.1667
+    }
+
+    efficiency = 1.0 / (1.0 + 0.1 * 1.0)  # 1/1.1 = ~0.90909
+    confidence_term = 0.5 * 1.0
+    efficiency_term = 0.3 * efficiency
+
+    previous_score = 1.0
+    for risk, factor in expected_risk_factors.items():
+        report = ValidationReport(
+            ok=True, issues=[], max_risk=risk, approvals_needed=[], step_count=1
+        )
+        cand = StrategyCandidate(name="t", rationale="r", playbook=dummy_pb, validation=report)
+        score = StrategyExplorer.calculate_score(cand, succeeded_run, verdict)
+        expected_score = round(confidence_term + efficiency_term + 0.2 * factor, 4)
+        assert score == expected_score
+        assert score <= previous_score
+        previous_score = score
