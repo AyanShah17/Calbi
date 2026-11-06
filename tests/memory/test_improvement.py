@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from calbi.ai.verifier import Verdict
 from calbi.core.registry import ToolRegistry
 from calbi.core.schema import Playbook, Risk, Step
 from calbi.core.state import RunState, RunStatus
-from calbi.memory.improvement import ImprovementManager, ProposalStatus
+from calbi.memory.improvement import (
+    ImprovementManager,
+    ProposalStatus,
+    normalize_task,
+    task_similarity,
+)
 from calbi.memory.sqlite import SQLiteMemory
 
 
@@ -447,3 +454,303 @@ def test_reusable_qualification_after_min_runs_with_no_failures() -> None:
     assert proposal is not None
     assert proposal.status == ProposalStatus.PENDING
     assert "Reusable promotion qualification" in proposal.rationale
+
+
+def test_normalize_task_and_similarity_scoring() -> None:
+    """Task normalization case-folds, collapses whitespace, and strips punctuation."""
+    t1 = "  Deploy   Internal Metrics Dashboard!  "
+    t2 = "deploy-internal-metrics-dashboard"
+    t3 = "deploy internal metrics dashboard"
+    t4 = "deploy external metrics dashboard"
+
+    assert normalize_task(t1) == "deploy internal metrics dashboard"
+    assert normalize_task(t2) == "deploy internal metrics dashboard"
+    assert normalize_task(t3) == "deploy internal metrics dashboard"
+
+    # Exact normalized matches return 1.0
+    assert task_similarity(t1, t2) == 1.0
+    assert task_similarity(t1, t3) == 1.0
+
+    # Partial similarity
+    sim = task_similarity(t3, t4)
+    assert 0.70 < sim < 1.0
+
+    # Disjoint strings
+    assert task_similarity("abc", "xyz") == 0.0
+    assert task_similarity("", "") == 1.0
+    assert task_similarity("", "something") == 0.0
+
+
+def test_exact_normalized_task_match_aggregates_evidence_without_duplicate() -> None:
+    """Exact normalized task match prefers existing proposal and aggregates evidence."""
+    mem = SQLiteMemory(path=":memory:")
+    manager = ImprovementManager(memory=mem)
+
+    pb_base = _make_playbook("dep_base", ["tool_read", "tool_write"])
+    pb_cand = _make_playbook("dep_cand", ["tool_read"])
+
+    # 1. First run with messy casing and punctuation
+    prop1 = manager.evaluate_improvement(
+        task="  Deploy   Internal Metrics Dashboard!  ",
+        baseline=pb_base,
+        candidate=pb_cand,
+        run=RunState(run_id="run_d1", playbook=pb_cand, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert prop1 is not None
+    assert prop1.evidence_run_ids == ["run_d1"]
+
+    # 2. Second run with normalized task string
+    prop2 = manager.evaluate_improvement(
+        task="deploy internal metrics dashboard",
+        baseline=pb_base,
+        candidate=pb_cand,
+        run=RunState(run_id="run_d2", playbook=pb_cand, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert prop2 is not None
+    assert prop2.proposal_id == prop1.proposal_id
+    assert "run_d1" in prop2.evidence_run_ids
+    assert "run_d2" in prop2.evidence_run_ids
+    assert len(manager.list_proposals()) == 1
+
+
+def test_weak_similarity_memory_match_does_not_create_optimization_proposal() -> None:
+    """A weak similarity match from memory (< threshold) does not trigger optimization proposal."""
+    mem = SQLiteMemory(path=":memory:")
+    manager = ImprovementManager(memory=mem, similarity_threshold=0.85)
+
+    # Seed an existing validated playbook for survey data
+    old_pb = _make_playbook("survey_v1", ["tool_read", "tool_read", "tool_read", "tool_read"])
+    rec_id = mem.save_run(
+        "clean and analyze survey data",
+        old_pb,
+        RunState(run_id="seed_survey", playbook=old_pb, status=RunStatus.SUCCEEDED),
+    )
+    mem.promote(rec_id, to="validated")
+
+    # New run for customer feedback data (shares 'clean', 'and', 'analyze' with survey data)
+    cand_pb = _make_playbook("feedback_v1", ["tool_read"])
+    run = RunState(run_id="run_feedback", playbook=cand_pb, status=RunStatus.SUCCEEDED)
+
+    # Memory find_similar may return survey record, but similarity is below 0.85
+    proposal = manager.evaluate_improvement(
+        task="clean and analyze customer feedback data",
+        baseline=None,
+        candidate=cand_pb,
+        run=run,
+        verdict=Verdict(passed=True),
+    )
+
+    # Must NOT propose optimization against unrelated survey baseline
+    assert proposal is None
+    assert len(manager.list_proposals()) == 0
+
+
+def test_configurable_similarity_threshold_enforcement() -> None:
+    """Configurable similarity threshold controls whether near-matches trigger optimization."""
+    mem = SQLiteMemory(path=":memory:")
+
+    old_pb = _make_playbook("survey_v1", ["tool_read", "tool_read", "tool_read", "tool_read"])
+    rec_id = mem.save_run(
+        "clean and analyze survey data",
+        old_pb,
+        RunState(run_id="seed_survey", playbook=old_pb, status=RunStatus.SUCCEEDED),
+    )
+    mem.promote(rec_id, to="validated")
+
+    cand_pb = _make_playbook("feedback_v1", ["tool_read"])
+    run = RunState(run_id="run_fb", playbook=cand_pb, status=RunStatus.SUCCEEDED)
+
+    # 1. Permissive threshold: 0.70 allows ~0.75 match to trigger optimization
+    permissive_manager = ImprovementManager(memory=mem, similarity_threshold=0.70)
+    prop_permissive = permissive_manager.evaluate_improvement(
+        task="clean and analyze customer feedback data",
+        baseline=None,
+        candidate=cand_pb,
+        run=run,
+        verdict=Verdict(passed=True),
+    )
+    assert prop_permissive is not None
+    assert prop_permissive.steps_saved == 3
+
+    # 2. Strict threshold: 0.90 rejects ~0.75 match
+    strict_manager = ImprovementManager(memory=mem, similarity_threshold=0.90)
+    prop_strict = strict_manager.evaluate_improvement(
+        task="clean and analyze customer feedback data",
+        baseline=None,
+        candidate=cand_pb,
+        run=run,
+        verdict=Verdict(passed=True),
+    )
+    assert prop_strict is None
+
+
+def test_pending_proposal_overwrite_requires_normalized_match_or_threshold() -> None:
+    """Pending proposal is updated only if task matches and candidate is better."""
+    mem = SQLiteMemory(path=":memory:")
+    manager = ImprovementManager(memory=mem, similarity_threshold=0.85)
+
+    pb_base = _make_playbook("tax_base", ["tool_read", "tool_write", "tool_read"])
+    pb_cand1 = _make_playbook("tax_v1", ["tool_read", "tool_write"])  # saves 1 step
+
+    # 1. Create initial proposal P1
+    prop1 = manager.evaluate_improvement(
+        task="process quarterly tax returns",
+        baseline=pb_base,
+        candidate=pb_cand1,
+        run=RunState(run_id="r_tax_1", playbook=pb_cand1, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert prop1 is not None
+    assert prop1.steps_saved == 1
+    p1_id = prop1.proposal_id
+
+    # 2. Candidate for a weakly similar task ("process annual tax returns", sim < 0.85)
+    # Even if cand_other saves 2 steps, it must NOT overwrite P1; it becomes a distinct proposal!
+    pb_cand_other = _make_playbook("annual_tax", ["tool_read"])
+    pb_base_other = _make_playbook("annual_base", ["tool_read", "tool_read", "tool_read"])
+    prop_distinct = manager.evaluate_improvement(
+        task="process annual tax returns",
+        baseline=pb_base_other,
+        candidate=pb_cand_other,
+        run=RunState(run_id="r_ann_1", playbook=pb_cand_other, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert prop_distinct is not None
+    assert prop_distinct.proposal_id != p1_id
+    assert len(manager.list_proposals()) == 2
+
+    # P1 remains intact
+    assert manager.get_proposal(p1_id).steps_saved == 1
+
+    # 3. Candidate for exact normalized match ("Process Quarterly Tax Returns!") with BETTER savings
+    pb_cand_better = _make_playbook("tax_v2", ["tool_read"])  # saves 2 steps
+    prop_updated = manager.evaluate_improvement(
+        task="Process Quarterly Tax Returns!",
+        baseline=pb_base,
+        candidate=pb_cand_better,
+        run=RunState(run_id="r_tax_better", playbook=pb_cand_better, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert prop_updated is not None
+    assert prop_updated.proposal_id == p1_id
+    assert prop_updated.steps_saved == 2
+    assert prop_updated.proposed_playbook == pb_cand_better
+    assert "r_tax_better" in prop_updated.evidence_run_ids
+    assert len(manager.list_proposals()) == 2
+
+    # 4. Candidate for exact normalized match with WORSE savings (e.g. saves 0 steps)
+    # Must NOT overwrite P1 with worse candidate
+    pb_cand_worse = _make_playbook("tax_v3", ["tool_read", "tool_write", "tool_read"])
+    prop_not_overwritten = manager.evaluate_improvement(
+        task="Process Quarterly Tax Returns!",
+        baseline=pb_base,
+        candidate=pb_cand_worse,
+        run=RunState(run_id="r_tax_worse", playbook=pb_cand_worse, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert prop_not_overwritten is not None
+    assert prop_not_overwritten.proposal_id == p1_id
+    assert prop_not_overwritten.steps_saved == 2  # Still keeps the better candidate!
+
+
+def test_sqlite_persistence_across_process_restarts(tmp_path: Path) -> None:
+    """Improvement proposals persist in SQLite across ImprovementManager restarts."""
+    db_file = tmp_path / "proposals.sqlite"
+    mem = SQLiteMemory(path=":memory:")
+
+    pb_base = _make_playbook("persist_base", ["tool_read", "tool_write", "tool_read"])
+    pb_cand1 = _make_playbook("persist_cand1", ["tool_read", "tool_write"])
+    pb_cand2 = _make_playbook("persist_cand2", ["tool_read"])
+
+    # Session 1: Create two proposals
+    mgr1 = ImprovementManager(memory=mem, db_path=db_file)
+    p1 = mgr1.evaluate_improvement(
+        task="optimize database indices",
+        baseline=pb_base,
+        candidate=pb_cand1,
+        run=RunState(run_id="run_p1", playbook=pb_cand1, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    p2 = mgr1.evaluate_improvement(
+        task="prune stale session tokens",
+        baseline=pb_base,
+        candidate=pb_cand2,
+        run=RunState(run_id="run_p2", playbook=pb_cand2, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert p1 is not None and p2 is not None
+    p1_id = p1.proposal_id
+    p2_id = p2.proposal_id
+    mgr1.close()
+
+    # Session 2: Re-instantiate from the same SQLite DB file
+    mgr2 = ImprovementManager(memory=mem, storage_path=db_file)
+    assert len(mgr2.list_proposals()) == 2
+    restored_p1 = mgr2.get_proposal(p1_id)
+    assert restored_p1.task == "optimize database indices"
+    assert restored_p1.status == ProposalStatus.PENDING
+    assert restored_p1.steps_saved == 1
+    assert restored_p1.evidence_run_ids == ["run_p1"]
+    assert restored_p1.proposed_playbook.name == "persist_cand1"
+
+    # Approve proposal 1 in session 2
+    record = mgr2.approve(p1_id)
+    assert record.status == "reusable"
+    assert restored_p1.status == ProposalStatus.APPROVED
+    mgr2.close()
+
+    # Session 3: Re-instantiate and verify proposal 1 remains APPROVED
+    mgr3 = ImprovementManager(memory=mem, db_path=db_file)
+    assert mgr3.get_proposal(p1_id).status == ProposalStatus.APPROVED
+    assert len(mgr3.list_proposals(ProposalStatus.APPROVED)) == 1
+    assert len(mgr3.list_proposals(ProposalStatus.PENDING)) == 1
+
+    # Reject proposal 2 in session 3
+    mgr3.reject(p2_id, reason="Requires architectural review")
+    assert mgr3.get_proposal(p2_id).status == ProposalStatus.REJECTED
+    mgr3.close()
+
+    # Session 4: Re-instantiate and verify rejection persisted
+    mgr4 = ImprovementManager(memory=mem, storage_path=db_file)
+    restored_p2 = mgr4.get_proposal(p2_id)
+    assert restored_p2.status == ProposalStatus.REJECTED
+    assert restored_p2.rejection_reason == "Requires architectural review"
+    mgr4.close()
+
+
+def test_file_backed_json_persistence_across_restarts(tmp_path: Path) -> None:
+    """Improvement proposals persist in a JSON file across ImprovementManager restarts."""
+    json_file = tmp_path / "proposals.json"
+    mem = SQLiteMemory(path=":memory:")
+
+    pb_base = _make_playbook("json_base", ["tool_read", "tool_write"])
+    pb_cand = _make_playbook("json_cand", ["tool_read"])
+
+    # Session 1: Create proposal in JSON-backed manager
+    mgr1 = ImprovementManager(memory=mem, storage_path=json_file)
+    prop = mgr1.evaluate_improvement(
+        task="compress archived customer logs",
+        baseline=pb_base,
+        candidate=pb_cand,
+        run=RunState(run_id="run_json_1", playbook=pb_cand, status=RunStatus.SUCCEEDED),
+        verdict=Verdict(passed=True),
+    )
+    assert prop is not None
+    assert json_file.exists()
+    prop_id = prop.proposal_id
+
+    # Session 2: Re-instantiate from the same JSON file
+    mgr2 = ImprovementManager(memory=mem, storage_path=json_file)
+    assert len(mgr2.list_proposals()) == 1
+    restored = mgr2.get_proposal(prop_id)
+    assert restored.task == "compress archived customer logs"
+    assert restored.steps_saved == 1
+    assert restored.evidence_run_ids == ["run_json_1"]
+
+    # Reject and verify persistence in JSON
+    mgr2.reject(prop_id, reason="Not needed right now")
+    mgr3 = ImprovementManager(memory=mem, storage_path=json_file)
+    assert mgr3.get_proposal(prop_id).status == ProposalStatus.REJECTED
+    assert mgr3.get_proposal(prop_id).rejection_reason == "Not needed right now"
